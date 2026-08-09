@@ -135,8 +135,8 @@ GoReleaser 自动上传到 [Releases 页面](https://github.com/qozi/cert-keeper
 
 | 镜像 | 用途 | 平台 | Registry |
 |---|---|---|---|
-| `ghcr.io/qozi/cert-keeper/server` | 服务端（含 acme.sh） | linux/amd64, linux/arm64 | GitHub Container Registry |
-| `ghcr.io/qozi/cert-keeper/client` | 客户端（最小化运行时） | linux/amd64, linux/arm64 | GitHub Container Registry |
+| `ghcr.io/qozi/certkeeper/certk-server` | 服务端（含 acme.sh） | linux/amd64, linux/arm64 | GitHub Container Registry |
+| `ghcr.io/qozi/certkeeper/certk-client` | 客户端（最小化运行时） | linux/amd64, linux/arm64 | GitHub Container Registry |
 
 **镜像标签**（每次发布自动生成）：
 
@@ -154,11 +154,11 @@ GoReleaser 自动上传到 [Releases 页面](https://github.com/qozi/cert-keeper
 
 ```bash
 # 拉取最新版
-docker pull ghcr.io/qozi/cert-keeper/server:latest
-docker pull ghcr.io/qozi/cert-keeper/client:latest
+docker pull ghcr.io/qozi/certkeeper/certk-server:latest
+docker pull ghcr.io/qozi/certkeeper/certk-client:latest
 
 # 拉取指定版本
-docker pull ghcr.io/qozi/cert-keeper/server:v1.0.0
+docker pull ghcr.io/qozi/certkeeper/certk-server:v1.0.0
 
 # 使用 docker-compose 启动服务端
 cp deploy/config.example.yaml deploy/data/config/config.yaml  # 按需修改

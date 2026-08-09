@@ -73,22 +73,47 @@ curl -X POST "https://ck.example.com:8443/api/v1/certs/apply" \
 cd extra-tools/cert-keeper
 ./scripts/build.sh          # 当前平台
 ./scripts/build.sh all      # 跨平台
-./scripts/build.sh docker   # Docker 镜像（certkeeper/server:latest / certkeeper/client:latest）
+./scripts/build.sh docker   # Docker 镜像（certkeeper/certk-server:latest / certkeeper/certk-client:latest）
 ```
 
-### 2. 启动服务端（Docker）
+### 2. 本地源码调试（不发布、不依赖 Docker）
+
+无需构建二进制或镜像，直接用 `go run` 启动服务端和客户端。本地持久化目录在工作区 `./.local/data`，已加入 `.gitignore`。
+
+```bash
+# 终端1：启动服务端（首次启动会在日志输出 admin token secret，仅显示一次）
+go run ./cmd/server -config deploy/config.local.example.yaml
+```
+
+```bash
+# 终端2：编辑 deploy/client.local.example.yaml，填入服务端日志输出的 admin secret
+#         随后可直接用 -c 指定该配置运行客户端
+go run ./cmd/client -c deploy/client.local.example.yaml test
+go run ./cmd/client -c deploy/client.local.example.yaml register
+go run ./cmd/client -c deploy/client.local.example.yaml apply -d example.com --out-dir ./.local/certs
+```
+
+仅调试 API、SQLite、鉴权与客户端通信时，无需安装 `acme.sh`；真实签发证书仍需本机安装 [acme.sh](https://get.acme.sh)。本机调试可配合 Delve 断点：
+
+```bash
+go install github.com/go-delve/delve/cmd/dlv@latest
+dlv debug ./cmd/server -- -config deploy/config.local.example.yaml
+dlv debug ./cmd/client -- -c deploy/client.local.example.yaml test
+```
+
+### 3. 启动服务端（Docker）
 
 ```bash
 cd deploy
 # 生成加密密钥（首次）
-docker run --rm certkeeper/server:latest --gen-encryption-key > .env
+docker run --rm certkeeper/certk-server:latest --gen-encryption-key > .env
 echo "CK_ENCRYPTION_KEY=$(cat .env)" > .env
 docker compose up -d
 # 首次启动会在日志输出 admin token secret，仅显示一次
 docker compose logs certkeeper | grep "已创建 admin token"
 ```
 
-### 3. 配置证书（方式1）
+### 4. 配置证书（方式1）
 
 ```bash
 # 1. 添加 DNS Secret（以 CloudFlare 为例）
@@ -106,7 +131,7 @@ curl -X POST .../api/v1/admin/tokens \
   -d '{"note":"web-01","auto_gen":true,"enabled":true}'
 ```
 
-### 4. 客户端使用
+### 5. 客户端使用
 
 ```bash
 # 部署客户端二进制
@@ -144,7 +169,9 @@ extra-tools/cert-keeper/
 │   ├── docker-compose.yml
 │   ├── entrypoint-server.sh
 │   ├── config.example.yaml
-│   └── client.example.yaml
+│   ├── client.example.yaml
+│   ├── config.local.example.yaml  本地源码调试（go run）
+│   └── client.local.example.yaml  本地源码调试（go run）
 └── scripts/build.sh            本地 / 跨平台 / Docker 构建
 ```
 

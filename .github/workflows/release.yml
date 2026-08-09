@@ -38,7 +38,7 @@ jobs:
       - id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/qozi/cert-keeper/server
+          images: ghcr.io/qozi/certkeeper/certk-server
           tags: |
             type=semver,pattern={{raw}}
             type=semver,pattern={{major}}.{{minor}}
@@ -70,7 +70,7 @@ jobs:
       - id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/qozi/cert-keeper/client
+          images: ghcr.io/qozi/certkeeper/certk-client
           tags: |
             type=semver,pattern={{raw}}
             type=semver,pattern={{major}}.{{minor}}

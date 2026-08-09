@@ -1,0 +1,35 @@
+# CertKeeper 服务端本地调试配置
+# 适用场景：在源码目录用 `go run ./cmd/server -config deploy/config.local.example.yaml` 启动
+# 持久化目录在工作区 ./.local/data 下，不依赖 /data，不依赖 Docker
+# 真实签发证书需要本机安装 acme.sh（https://get.acme.sh）
+
+server:
+  listen: "127.0.0.1:8443"   # 仅监听本机，避免暴露到外网
+  tls: false
+  base_url: "http://127.0.0.1:8443"
+
+auth:
+  timestamp_window_sec: 300
+  nonce_ttl_sec: 300
+  admin_token_id: "admin"    # 首次启动自动创建 admin token，secret 仅在日志中输出一次
+
+storage:
+  sqlite_path: "./.local/data/db/certkeeper.db"
+  # 本地调试用固定密钥；切勿用于生产；更换后已存的 DNS Secret 将无法解密
+  encryption_key: "local-dev-encryption-key-32-bytes-or-more"
+
+acme:
+  home: "./.local/data/acme"
+  certs_dir: "./.local/data/certs"
+  default_ca: "letsencrypt"
+  default_keylength: "ec-256"
+  default_renew_days: 30
+  issue_timeout: 300s
+  auto_upgrade: false        # 本地调试关闭启动时 acme.sh 自动升级
+  acme_sh_path: "acme.sh"    # 若未安装 acme.sh，启动时会打印警告，但不影响 API/鉴权调试
+
+log:
+  level: "debug"
+  file: ""                   # 留空输出到 stdout，便于 go run 直接查看
+  max_size_mb: 10
+  max_backups: 3

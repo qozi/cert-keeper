@@ -15,6 +15,9 @@ vendor/
 # 测试数据
 testdata/
 
+# 本地调试持久化（deploy/config.local.example.yaml 使用）
+.local/
+
 # IDE
 .idea/
 .vscode/

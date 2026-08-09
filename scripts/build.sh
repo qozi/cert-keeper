@@ -45,8 +45,8 @@ build_all() {
 
 build_docker() {
     cd "$ROOT"
-    docker build -f deploy/Dockerfile -t certkeeper/server:latest --target server .
-    docker build -f deploy/Dockerfile -t certkeeper/client:latest --target client .
+    docker build -f deploy/Dockerfile -t certkeeper/certk-server:latest --target server .
+    docker build -f deploy/Dockerfile -t certkeeper/certk-client:latest --target client .
     echo "==> Docker 镜像构建完成"
 }
 

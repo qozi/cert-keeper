@@ -1,0 +1,23 @@
+# CertKeeper 客户端本地调试配置
+# 适用场景：配合 deploy/config.local.example.yaml 启动的本地服务端
+# 用法：
+#   go run ./cmd/client -c deploy/client.local.example.yaml test
+#   go run ./cmd/client -c deploy/client.local.example.yaml register
+#   go run ./cmd/client -c deploy/client.local.example.yaml apply -d example.com --out-dir ./.local/certs
+# 首次启动服务端时，日志会打印 admin token secret（仅一次），填入下方 token_secret
+
+server: "http://127.0.0.1:8443"
+token_id: "admin"
+token_secret: "REPLACE_WITH_ADMIN_SECRET_FROM_SERVER_LOG"
+log_file: ""
+log_level: "debug"
+
+defaults:
+  out_dir: "./.local/certs"
+  cert_file: "cert.pem"
+  key_file: "key.pem"
+  fullchain_file: "fullchain.pem"
+  ca_file: "ca.pem"
+  # 本地调试默认不执行 verify / reload，按需覆盖
+  verify_cmd: ""
+  reload_cmd: ""
