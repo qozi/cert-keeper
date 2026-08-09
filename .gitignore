@@ -1,0 +1,23 @@
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 编译输出
+dist/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Go
+vendor/
+
+# 测试数据
+testdata/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

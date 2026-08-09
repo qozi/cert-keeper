@@ -1,0 +1,36 @@
+# CertKeeper 服务端示例配置
+# 部署时放在 /data/config/config.yaml 或挂载位置
+
+server:
+  listen: ":8443"           # 监听地址端口
+  tls: false                # 是否启用 HTTPS（建议反向代理终止 TLS）
+  cert_file: ""             # tls=true 时必填
+  key_file: ""              # tls=true 时必填
+  base_url: "https://ck.example.com:8443"
+
+auth:
+  timestamp_window_sec: 300  # 客户端时间戳允许误差
+  nonce_ttl_sec: 300          # nonce 防重放窗口
+  admin_token_id: "admin"     # 首次启动自动创建的 admin token id
+
+storage:
+  sqlite_path: "/data/db/certkeeper.db"
+  # 留空则从 CK_ENCRYPTION_KEY 环境变量读取
+  # 用 ck-server --gen-encryption-key 生成
+  encryption_key: ""
+
+acme:
+  home: "/data/acme"          # acme.sh 主目录
+  certs_dir: "/data/certs"    # 证书产物根目录
+  default_ca: "letsencrypt"   # letsencrypt / zerossl / buypass
+  default_keylength: "ec-256"
+  default_renew_days: 30
+  issue_timeout: 300s         # 单次签发超时
+  auto_upgrade: true          # 启动时升级 acme.sh
+  acme_sh_path: "/root/.acme.sh/acme.sh"
+
+log:
+  level: "info"               # debug / info / warn / error
+  file: "/data/logs/certkeeper.log"
+  max_size_mb: 10
+  max_backups: 3

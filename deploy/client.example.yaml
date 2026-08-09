@@ -1,0 +1,19 @@
+# CertKeeper 客户端示例配置
+# 部署到目标机器 /etc/certkeeper/client.yaml
+
+server: "https://ck.example.com:8443"
+token_id: "web01"
+token_secret: "REPLACE_WITH_TOKEN_SECRET"
+log_file: "/var/log/certkeeper.log"
+log_level: "info"
+
+defaults:
+  out_dir: "/etc/nginx/certs"
+  cert_file: "cert.pem"
+  key_file: "key.pem"
+  fullchain_file: "fullchain.pem"
+  ca_file: "ca.pem"
+  # nginx 校验命令
+  verify_cmd: "nginx -t"
+  # nginx reload 命令
+  reload_cmd: "systemctl reload nginx"

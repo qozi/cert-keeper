@@ -1,0 +1,24 @@
+version: "3.8"
+
+services:
+  certkeeper:
+    image: certkeeper/server:latest
+    # 如需自行构建：取消下面两行注释
+    # build:
+    #   context: ..
+    #   dockerfile: deploy/Dockerfile
+    container_name: certkeeper
+    restart: unless-stopped
+    ports:
+      - "8443:8443"
+    volumes:
+      - ./data:/data
+    environment:
+      - CK_ENCRYPTION_KEY=${CK_ENCRYPTION_KEY:-please-change-me-32-bytes-or-more}
+      - TZ=Asia/Shanghai
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8443/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
