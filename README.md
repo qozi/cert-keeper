@@ -4,8 +4,8 @@
 
 ## 设计
 
-- **服务端（`ck-server`）**：Go 编写，包装 acme.sh 完成签发与续签，对外暴露 HTTP API；SQLite 持久化（证书配置、token、DNS Secret、客户端、申请日志）；最终以 Docker 镜像运行。
-- **客户端（`ck-client`）**：单二进制 Go 程序，可手动或 cron 调用；与服务端鉴权通信，下载证书到本地，可选执行 verify / reload 命令使证书立即生效。
+- **服务端（`certk-server`）**：Go 编写，包装 acme.sh 完成签发与续签，对外暴露 HTTP API；SQLite 持久化（证书配置、token、DNS Secret、客户端、申请日志）；最终以 Docker 镜像运行。
+- **客户端（`certk-client`）**：单二进制 Go 程序，可手动或 cron 调用；与服务端鉴权通信，下载证书到本地，可选执行 verify / reload 命令使证书立即生效。
 
 ### 两种使用模式
 
@@ -110,7 +110,7 @@ curl -X POST .../api/v1/admin/tokens \
 
 ```bash
 # 部署客户端二进制
-sudo install -m 0755 ck-client /usr/local/bin/certkeeper-client
+sudo install -m 0755 certk-client /usr/local/bin/certkeeper-client
 sudo mkdir -p /etc/certkeeper
 sudo cp client.example.yaml /etc/certkeeper/client.yaml
 # 编辑 /etc/certkeeper/client.yaml 填入 server / token_id / token_secret
@@ -200,6 +200,10 @@ DNS Secret 由服务端按 `provider` 名分组加密存储；acme.sh 调用时�
 - 方式2 推参申请默认要求 admin token，避免普通客户端签发任意域名。
 - 服务端自身 TLS 证书建议由反向代理（nginx/Caddy）终止；如需服务端直接暴露 HTTPS，在配置中开启 `tls` 并指定证书路径（可先用 acme.sh 为服务端自身域名签一张）。
 - DNS 手动模式（`dns_manual`）无自动续签，仅用于一次性签发。
+
+## 相关文档
+
+- [发布指南](docs/releasing.md)
 
 ## 许可
 

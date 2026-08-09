@@ -16,7 +16,7 @@ auth:
 storage:
   sqlite_path: "/data/db/certkeeper.db"
   # 留空则从 CK_ENCRYPTION_KEY 环境变量读取
-  # 用 ck-server --gen-encryption-key 生成
+  # 用 certk-server --gen-encryption-key 生成
   encryption_key: ""
 
 acme:

@@ -8,9 +8,9 @@ const Version = "0.1.0"
 
 const (
 	// ServerComponent 是服务端组件名称。
-	ServerComponent = "ck-server"
+	ServerComponent = "certk-server"
 	// ClientComponent 是客户端组件名称。
-	ClientComponent = "ck-client"
+	ClientComponent = "certk-client"
 )
 
 // String 返回组件的完整版本字符串。

@@ -13,10 +13,10 @@ DIST="$ROOT/dist"
 build_native() {
     mkdir -p "$DIST"
     cd "$ROOT"
-    echo "==> 构建 ck-server ($(go env GOOS)/$(go env GOARCH))"
-    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$DIST/ck-server" ./cmd/server
-    echo "==> 构建 ck-client ($(go env GOOS)/$(go env GOARCH))"
-    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$DIST/ck-client" ./cmd/client
+    echo "==> 构建 certk-server ($(go env GOOS)/$(go env GOARCH))"
+    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$DIST/certk-server" ./cmd/server
+    echo "==> 构建 certk-client ($(go env GOOS)/$(go env GOARCH))"
+    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$DIST/certk-client" ./cmd/client
     echo "==> 完成: $DIST"
 }
 
@@ -33,11 +33,11 @@ build_all() {
     for t in "${targets[@]}"; do
         local os="${t%/*}"
         local arch="${t#*/}"
-        local out="$DIST/ck-server-${os}-${arch}"
-        echo "==> 构建 ck-server $os/$arch"
+        local out="$DIST/certk-server-${os}-${arch}"
+        echo "==> 构建 certk-server $os/$arch"
         CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -ldflags="-s -w" -o "$out" ./cmd/server
-        local outc="$DIST/ck-client-${os}-${arch}"
-        echo "==> 构建 ck-client $os/$arch"
+        local outc="$DIST/certk-client-${os}-${arch}"
+        echo "==> 构建 certk-client $os/$arch"
         CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -ldflags="-s -w" -o "$outc" ./cmd/client
     done
     echo "==> 完成: $DIST"

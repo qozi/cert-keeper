@@ -40,5 +40,5 @@ if [ -x /root/.acme.sh/acme.sh ]; then
     /root/.acme.sh/acme.sh --upgrade --auto-upgrade --home /data/acme 2>&1 | sed 's/^/[acme-upgrade] /' || true
 fi
 
-echo "[entrypoint] 启动 ck-server $@"
-exec /usr/local/bin/ck-server "$@"
+echo "[entrypoint] 启动 certk-server $@"
+exec /usr/local/bin/certk-server "$@"
