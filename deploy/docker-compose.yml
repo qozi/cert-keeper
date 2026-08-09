@@ -2,7 +2,7 @@ version: "3.8"
 
 services:
   certkeeper:
-    image: certkeeper/server:latest
+    image: ghcr.io/qozi/cert-keeper/server:latest
     # 如需自行构建：取消下面两行注释
     # build:
     #   context: ..

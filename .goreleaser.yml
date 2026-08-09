@@ -1,0 +1,58 @@
+project_name: certkeeper
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: ck-server
+    main: ./cmd/server
+    binary: ck-server
+    env:
+      - CGO_ENABLED=0
+    flags: [-trimpath]
+    ldflags: [-s, -w]
+    targets:
+      - linux_amd64
+      - linux_arm64
+      - linux_arm
+      - darwin_amd64
+      - darwin_arm64
+  - id: ck-client
+    main: ./cmd/client
+    binary: ck-client
+    env:
+      - CGO_ENABLED=0
+    flags: [-trimpath]
+    ldflags: [-s, -w]
+    targets:
+      - linux_amd64
+      - linux_arm64
+      - linux_arm
+      - darwin_amd64
+      - darwin_arm64
+
+archives:
+  - ids: [ck-server]
+    name_template: ck-server_{{ .Os }}_{{ .Arch }}
+  - ids: [ck-client]
+    name_template: ck-client_{{ .Os }}_{{ .Arch }}
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^chore:'
+      - '^test:'
+
+release:
+  github:
+    owner: qozi
+    name: cert-keeper
+  draft: false
+  prerelease: auto
