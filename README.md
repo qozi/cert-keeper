@@ -5,6 +5,7 @@
 ## 设计
 
 - **服务端（`certk-server`）**：Go 编写，包装 acme.sh 完成签发与续签，对外暴露 HTTP API；SQLite 持久化（证书配置、token、DNS Secret、客户端、申请日志）；最终以 Docker 镜像运行。
+- **服务端 CLI（`certk-server-cli`）**：直接读取服务端配置、SQLite 和证书目录，在服务端主机或容器内执行管理操作，不依赖 HTTP 或 HMAC 凭据。
 - **客户端（`certk-client`）**：单二进制 Go 程序，可手动或 cron 调用；与服务端鉴权通信，下载证书到本地，可选执行 verify / reload 命令使证书立即生效。
 
 ### 两种使用模式
@@ -45,9 +46,11 @@
 | `GET/POST` | `/api/v1/admin/certs` | 列出 / 创建证书配置 |
 | `DELETE` | `/api/v1/admin/certs/:domain` | 删除证书配置 |
 | `GET` | `/api/v1/admin/certs/status` | 所有证书有效期总览 |
-| `POST` | `/api/v1/admin/certs/:domain/reissue` | 手动触发重签（占位） |
+| `POST` | `/api/v1/admin/certs/:domain/reissue` | 手动触发重签 |
 | `GET/POST` | `/api/v1/admin/secrets` | 列出 / 添加 DNS Secret |
 | `DELETE` | `/api/v1/admin/secrets/:id` 或 `/:provider/:env_key` | 删除 Secret |
+| `GET` | `/api/v1/admin/providers` | 列出 acme.sh 支持的 DNS provider（含是否已配置标记） |
+| `GET` | `/api/v1/admin/providers/:provider/parameters` | 查询指定 provider 已配置参数（值已脱敏） |
 | `GET` | `/api/v1/admin/clients` | 客户端列表 |
 | `GET` | `/api/v1/admin/logs?domain=&client=&success=&limit=` | 申请日志 |
 
@@ -64,6 +67,48 @@ curl -X POST "https://ck.example.com:8443/api/v1/certs/apply" \
   -H "Content-Type: application/json" \
   -d '{"domain":"example.com"}'
 ```
+
+## 服务端 CLI
+
+`certk-server-cli` 与服务端共享同一份配置和 SQLite 数据库，适合在服务端主机上直接维护证书配置、Token、DNS Secret 和申请日志。默认配置路径为 `/data/config/config.yaml`，也可以通过全局 `-c/--config` 指定。
+
+```bash
+# Docker 容器内执行
+docker compose exec certkeeper certk-server-cli cert-config list
+docker compose exec certkeeper certk-server-cli cert status-all
+
+# 本地源码执行
+go run ./cmd/server-cli --config deploy/config.local.example.yaml cert-config list
+```
+
+支持的命令包括：
+
+- `cert apply/status/status-all/file/list/reissue`
+- `token list/get/create/update/delete`
+- `cert-config list/set/delete`
+- `secret list/set/delete`
+- `provider list/parameters`
+- `client list`
+- `log list`
+
+默认输出为表格，脚本调用可使用 `--output json`。全局参数必须放在资源命令之前：
+
+```bash
+certk-server-cli --config /data/config/config.yaml --output json token list
+certk-server-cli --config /data/config/config.yaml cert-config set \
+  -d example.com --mode dns_api --dns-provider dns_cf
+certk-server-cli --config /data/config/config.yaml cert apply -d example.com
+```
+
+DNS Secret 建议通过标准输入传入，避免出现在 shell 历史中：
+
+```bash
+printf '%s\n' '<your_cf_key>' | certk-server-cli \
+  --config /data/config/config.yaml secret set \
+  --provider dns_cf --env-key CF_Key --value-stdin
+```
+
+CLI 与服务端进程共享 ACME 文件锁，同一时间只允许一个进程调用 acme.sh。
 
 ## 快速开始
 
@@ -156,11 +201,14 @@ echo "0 3 * * * /usr/local/bin/certkeeper-client apply -d example.com --quiet" |
 extra-tools/cert-keeper/
 ├── cmd/
 │   ├── server/main.go          服务端入口
+│   ├── server-cli/main.go      服务端本地管理 CLI
 │   └── client/main.go          客户端入口
 ├── internal/
 │   ├── config/                  配置加载
 │   ├── store/                  SQLite + 迁移 + tokens/certs/secrets/clients/logs/nonces
 │   ├── acme/                   acme.sh 包装器 + 证书解析
+│   ├── lock/                   ACME 跨进程文件锁
+│   ├── service/                API 与 CLI 共用的业务操作
 │   ├── api/                    HTTP handler + auth 中间件 + admin/client 接口
 │   └── client/                 客户端逻辑（签名、下载、部署）
 ├── pkg/ckauth/                 签名 / 随机数 / 防重放工具

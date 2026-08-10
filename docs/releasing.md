@@ -7,7 +7,7 @@
 CertKeeper 采用 **GitHub Actions + GoReleaser** 自动发布：
 
 - 推送形如 `v*` 的 git tag → 自动触发 `.github/workflows/release.yml`
-- GoReleaser 构建多平台二进制（server / client）并创建 GitHub Release
+- GoReleaser 构建多平台二进制（server / server-cli / client）并创建 GitHub Release
 - 同时构建 `server` 和 `client` 两个 Docker 镜像，推送到 `ghcr.io`
 
 整个过程无需手动操作，打 tag 后等待 CI 完成即可。
@@ -67,7 +67,7 @@ git pull origin main
 发布前务必在本地验证构建和功能正常，所有产物输出到本地 `dist/` 和 Docker 镜像，不会影响远端。
 
 ```bash
-# 构建当前平台的 server + client 二进制（输出到 dist/）
+# 构建当前平台的 server + server-cli + client 二进制（输出到 dist/）
 scripts/build.sh native
 
 # 跨平台构建（输出到 dist/，发布前可选）
@@ -101,7 +101,7 @@ git push origin v1.0.0
 
 前往 [GitHub Actions](https://github.com/qozi/cert-keeper/actions) 查看进度，包含以下 jobs：
 
-- `goreleaser` — 构建多平台二进制 + 创建 GitHub Release
+- `goreleaser` — 构建多平台 server / server-cli / client 二进制 + 创建 GitHub Release
 - `docker-server` — 构建并推送服务端 Docker 镜像
 - `docker-client` — 构建并推送客户端 Docker 镜像
 
@@ -127,6 +127,11 @@ GoReleaser 自动上传到 [Releases 页面](https://github.com/qozi/cert-keeper
 | `certk-client_linux_arm` | Linux ARM v7 | tar.gz |
 | `certk-client_darwin_amd64` | macOS x86_64 | tar.gz |
 | `certk-client_darwin_arm64` | macOS Apple Silicon | tar.gz |
+| `certk-server-cli_linux_amd64` | Linux x86_64 | tar.gz |
+| `certk-server-cli_linux_arm64` | Linux ARM64 | tar.gz |
+| `certk-server-cli_linux_arm` | Linux ARM v7 | tar.gz |
+| `certk-server-cli_darwin_amd64` | macOS x86_64 | tar.gz |
+| `certk-server-cli_darwin_arm64` | macOS Apple Silicon | tar.gz |
 | `checksums.txt` | — | SHA256 校验和 |
 
 同时自动生成 [changelog](https://github.com/qozi/cert-keeper/releases)（基于 Conventional Commits，过滤 `docs` / `chore` / `test`）。
@@ -135,7 +140,7 @@ GoReleaser 自动上传到 [Releases 页面](https://github.com/qozi/cert-keeper
 
 | 镜像 | 用途 | 平台 | Registry |
 |---|---|---|---|
-| `ghcr.io/qozi/certkeeper/certk-server` | 服务端（含 acme.sh） | linux/amd64, linux/arm64 | GitHub Container Registry |
+| `ghcr.io/qozi/certkeeper/certk-server` | 服务端与 server-cli（含 acme.sh） | linux/amd64, linux/arm64 | GitHub Container Registry |
 | `ghcr.io/qozi/certkeeper/certk-client` | 客户端（最小化运行时） | linux/amd64, linux/arm64 | GitHub Container Registry |
 
 **镜像标签**（每次发布自动生成）：

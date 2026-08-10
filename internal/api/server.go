@@ -16,16 +16,25 @@ import (
 	"time"
 
 	"github.com/siidoo/certkeeper/internal/config"
+	"github.com/siidoo/certkeeper/internal/service"
 	"github.com/siidoo/certkeeper/internal/store"
 	"github.com/siidoo/certkeeper/pkg/ckauth"
 )
 
 // Server 是 HTTP API 服务器，管理路由和请求处理。
 type Server struct {
-	Cfg    *config.Config
-	Store  *store.Store
-	Logger Logger
-	now    func() time.Time
+	Cfg     *config.Config
+	Store   *store.Store
+	Service *service.Service
+	Logger  Logger
+	now     func() time.Time
+}
+
+func (s *Server) service() *service.Service {
+	if s.Service == nil {
+		s.Service = service.New(s.Cfg, s.Store)
+	}
+	return s.Service
 }
 
 // Logger 是日志记录器接口，支持 Info/Warn/Error 三个级别。
@@ -50,16 +59,18 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/v1/client/register", s.authed(s.registerClient))
 	mux.HandleFunc("/api/v1/client/heartbeat", s.authed(s.heartbeat))
 	mux.HandleFunc("/api/v1/certs/apply", s.authed(s.applyCert))
-	mux.HandleFunc("/api/v1/certs/", s.certSubtree)
+	mux.HandleFunc("/api/v1/certs/", s.authed(s.certSubtree))
 	mux.HandleFunc("/api/v1/ping", s.authed(s.ping))
 
 	// 管理 API（需 admin token）
 	mux.HandleFunc("/api/v1/admin/tokens", s.admin(s.tokensHandler))
-	mux.HandleFunc("/api/v1/admin/tokens/", s.tokensHandler)
+	mux.HandleFunc("/api/v1/admin/tokens/", s.admin(s.tokensHandler))
 	mux.HandleFunc("/api/v1/admin/certs", s.admin(s.certsAdminHandler))
-	mux.HandleFunc("/api/v1/admin/certs/", s.certsAdminHandler)
+	mux.HandleFunc("/api/v1/admin/certs/", s.admin(s.certsAdminHandler))
 	mux.HandleFunc("/api/v1/admin/secrets", s.admin(s.secretsHandler))
-	mux.HandleFunc("/api/v1/admin/secrets/", s.secretsHandler)
+	mux.HandleFunc("/api/v1/admin/secrets/", s.admin(s.secretsHandler))
+	mux.HandleFunc("/api/v1/admin/providers", s.admin(s.providersHandler))
+	mux.HandleFunc("/api/v1/admin/providers/", s.admin(s.providersHandler))
 	mux.HandleFunc("/api/v1/admin/clients", s.admin(s.clientsHandler))
 	mux.HandleFunc("/api/v1/admin/logs", s.admin(s.logsHandler))
 	return mux

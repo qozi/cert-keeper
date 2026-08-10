@@ -2,13 +2,14 @@
 package api
 
 import (
-	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/siidoo/certkeeper/internal/service"
 	"github.com/siidoo/certkeeper/internal/store"
 	"github.com/siidoo/certkeeper/pkg/ckauth"
 )
@@ -40,12 +41,12 @@ func (s *Server) tokensHandler(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, ts)
 	case http.MethodPost:
 		var req struct {
-			ID       string `json:"id"`
-			Secret   string `json:"secret"`
-			Note     string `json:"note"`
-			IsAdmin  bool   `json:"is_admin"`
-			Enabled  bool   `json:"enabled"`
-			AutoGen  bool   `json:"auto_gen"`
+			ID      string `json:"id"`
+			Secret  string `json:"secret"`
+			Note    string `json:"note"`
+			IsAdmin bool   `json:"is_admin"`
+			Enabled bool   `json:"enabled"`
+			AutoGen bool   `json:"auto_gen"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -129,29 +130,37 @@ func (s *Server) certsAdminHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, cs)
 	case http.MethodPost:
+		parts := splitPath(rest)
+		if len(parts) == 2 && parts[1] == "reissue" {
+			actor := "admin"
+			if token := tokenFromCtx(r); token != nil {
+				actor = token.ID
+			}
+			result, err := s.service().Reissue(r.Context(), parts[0], actor)
+			if err != nil {
+				var validationErr *service.ValidationError
+				code := http.StatusInternalServerError
+				if errors.As(err, &validationErr) {
+					code = http.StatusBadRequest
+				}
+				writeJSON(w, code, map[string]string{"error": err.Error()})
+				return
+			}
+			writeJSON(w, http.StatusOK, result)
+			return
+		}
 		var c store.Cert
 		if err := json.NewDecoder(r.Body).Decode(&c); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
-		if c.Domain == "" || c.ChallengeMode == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "domain 和 challenge_mode 必填"})
-			return
-		}
-		if c.CA == "" {
-			c.CA = s.Cfg.Acme.DefaultCA
-		}
-		if c.Keylength == "" {
-			c.Keylength = s.Cfg.Acme.DefaultKeylength
-		}
-		if c.RenewDays == 0 {
-			c.RenewDays = s.Cfg.Acme.DefaultRenewDays
-		}
-		if c.Source == "" {
-			c.Source = "preset"
-		}
-		if err := s.Store.UpsertCert(r.Context(), &c); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		if err := s.service().SaveCertConfig(r.Context(), &c); err != nil {
+			var validationErr *service.ValidationError
+			code := http.StatusInternalServerError
+			if errors.As(err, &validationErr) {
+				code = http.StatusBadRequest
+			}
+			writeJSON(w, code, map[string]string{"error": err.Error()})
 			return
 		}
 		writeJSON(w, http.StatusCreated, c)
@@ -172,23 +181,10 @@ func (s *Server) certsAdminHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) allCertsStatus(w http.ResponseWriter, r *http.Request) {
-	cs, err := s.Store.ListCerts(r.Context())
+	out, err := s.service().AllStatuses(r.Context())
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
-	}
-	out := []map[string]any{}
-	for _, c := range cs {
-		outDir := joinPath(s.Cfg.Acme.CertsDir, c.Domain)
-		notAfter, _ := readCertExpiry(outDir)
-		out = append(out, map[string]any{
-			"domain":         c.Domain,
-			"not_after":      notAfter,
-			"time_log":       readTimeLog(outDir),
-			"renew_days":     c.RenewDays,
-			"challenge_mode": c.ChallengeMode,
-			"exists":         fileExists(joinPath(outDir, "fullchain.pem")),
-		})
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -299,16 +295,3 @@ func (s *Server) logsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, logs)
 }
-
-func joinPath(parts ...string) string {
-	out := ""
-	for i, p := range parts {
-		if i > 0 && !strings.HasSuffix(out, "/") && !strings.HasPrefix(p, "/") {
-			out += "/"
-		}
-		out += strings.TrimPrefix(p, "/")
-	}
-	return out
-}
-
-var _ = sql.NullString{}

@@ -11,6 +11,8 @@ const (
 	ServerComponent = "certk-server"
 	// ClientComponent 是客户端组件名称。
 	ClientComponent = "certk-client"
+	// ServerCLIComponent 是服务端 CLI 组件名称。
+	ServerCLIComponent = "certk-server-cli"
 )
 
 // String 返回组件的完整版本字符串。

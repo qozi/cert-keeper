@@ -1,7 +1,7 @@
 # CertKeeper 客户端示例配置
 # 部署到目标机器 /etc/certkeeper/client.yaml
 
-server: "https://ck.example.com:8443"
+server: "https://ck.example.com:3780"
 token_id: "web01"
 token_secret: "REPLACE_WITH_TOKEN_SECRET"
 log_file: "/var/log/certkeeper.log"

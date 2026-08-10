@@ -20,6 +20,7 @@ import (
 	"github.com/siidoo/certkeeper/internal/acme"
 	"github.com/siidoo/certkeeper/internal/api"
 	"github.com/siidoo/certkeeper/internal/config"
+	"github.com/siidoo/certkeeper/internal/service"
 	"github.com/siidoo/certkeeper/internal/store"
 	"github.com/siidoo/certkeeper/internal/version"
 	"github.com/siidoo/certkeeper/pkg/ckauth"
@@ -91,7 +92,7 @@ func main() {
 	// 启动 nonce 清理 goroutine
 	go startNonceCleaner(st, cfg, logger)
 
-	srv := &api.Server{Cfg: cfg, Store: st, Logger: logger}
+	srv := &api.Server{Cfg: cfg, Store: st, Service: service.New(cfg, st), Logger: logger}
 	httpSrv := &http.Server{
 		Addr:    cfg.Server.Listen,
 		Handler: srv.Handler(),

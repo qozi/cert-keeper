@@ -5,6 +5,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/certk-server ./cmd/server \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/certk-server-cli ./cmd/server-cli \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/certk-client ./cmd/client
 
 # 阶段2: 服务端运行时（含 acme.sh + 必要工具）
@@ -14,6 +15,7 @@ RUN apk add --no-cache socat curl openssl ca-certificates tzdata bash \
  && curl -fsSL https://get.acme.sh | sh \
  && ln -sf /root/.acme.sh/acme.sh /usr/local/bin/acme.sh
 COPY --from=builder /out/certk-server /usr/local/bin/certk-server
+COPY --from=builder /out/certk-server-cli /usr/local/bin/certk-server-cli
 COPY deploy/entrypoint-server.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 VOLUME ["/data"]

@@ -2,11 +2,11 @@
 # 部署时放在 /data/config/config.yaml 或挂载位置
 
 server:
-  listen: ":8443"           # 监听地址端口
+  listen: ":3780"           # 监听地址端口
   tls: false                # 是否启用 HTTPS（建议反向代理终止 TLS）
   cert_file: ""             # tls=true 时必填
   key_file: ""              # tls=true 时必填
-  base_url: "https://ck.example.com:8443"
+  base_url: "https://ck.example.com:3780"
 
 auth:
   timestamp_window_sec: 300  # 客户端时间戳允许误差

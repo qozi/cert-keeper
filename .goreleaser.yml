@@ -31,12 +31,27 @@ builds:
       - linux_arm
       - darwin_amd64
       - darwin_arm64
+  - id: certk-server-cli
+    main: ./cmd/server-cli
+    binary: certk-server-cli
+    env:
+      - CGO_ENABLED=0
+    flags: [-trimpath]
+    ldflags: [-s, -w]
+    targets:
+      - linux_amd64
+      - linux_arm64
+      - linux_arm
+      - darwin_amd64
+      - darwin_arm64
 
 archives:
   - ids: [certk-server]
     name_template: certk-server_{{ .Os }}_{{ .Arch }}
   - ids: [certk-client]
     name_template: certk-client_{{ .Os }}_{{ .Arch }}
+  - ids: [certk-server-cli]
+    name_template: certk-server-cli_{{ .Os }}_{{ .Arch }}
 
 checksum:
   name_template: checksums.txt

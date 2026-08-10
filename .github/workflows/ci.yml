@@ -19,7 +19,7 @@ jobs:
           cache: true
       - run: go vet ./...
       - run: go test -race -coverprofile=cover.out ./...
-      - run: go build ./cmd/server && go build ./cmd/client
+      - run: go build ./cmd/server && go build ./cmd/server-cli && go build ./cmd/client
       - uses: actions/upload-artifact@v4
         with:
           name: coverage

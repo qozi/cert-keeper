@@ -126,6 +126,61 @@ func (s *Store) ListSecretsByProvider(ctx context.Context, provider, keyStr stri
 	return out, rows.Err()
 }
 
+// SecretParameter 表示已配置的 provider 参数项，按 env_key 字母序返回。
+// EnvValue 为解密后的明文，调用方需自行脱敏后再返回给前端。
+type SecretParameter struct {
+	EnvKey    string `json:"env_key"`
+	EnvValue  string `json:"env_value"`
+	CreatedAt int64  `json:"created_at"`
+}
+
+// ListSecretParameters 列出指定 provider 的所有参数（已解密），按 env_key 字母序排序。
+func (s *Store) ListSecretParameters(ctx context.Context, provider, keyStr string) ([]SecretParameter, error) {
+	rows, err := s.DB.QueryContext(ctx,
+		`SELECT env_key, env_value, created_at FROM dns_secrets WHERE provider=? ORDER BY env_key`, provider)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SecretParameter
+	for rows.Next() {
+		var envKey, enc string
+		var createdAt int64
+		if err := rows.Scan(&envKey, &enc, &createdAt); err != nil {
+			return nil, err
+		}
+		pt, err := decryptSecret(enc, keyStr)
+		if err != nil {
+			return nil, fmt.Errorf("解密 %s/%s 失败: %w", provider, envKey, err)
+		}
+		out = append(out, SecretParameter{
+			EnvKey:    envKey,
+			EnvValue:  pt,
+			CreatedAt: createdAt,
+		})
+	}
+	return out, rows.Err()
+}
+
+// ConfiguredProviders 返回所有已在 dns_secrets 表中配置过参数的 provider 名称，按字母序排序。
+func (s *Store) ConfiguredProviders(ctx context.Context) ([]string, error) {
+	rows, err := s.DB.QueryContext(ctx,
+		`SELECT DISTINCT provider FROM dns_secrets ORDER BY provider`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
 // DeleteSecret 根据 ID 删除 DNS Secret。
 func (s *Store) DeleteSecret(ctx context.Context, id int64) error {
 	_, err := s.DB.ExecContext(ctx, `DELETE FROM dns_secrets WHERE id=?`, id)
