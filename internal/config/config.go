@@ -12,20 +12,40 @@ import (
 
 // Config 是 CertKeeper 的主配置结构，包含服务器、认证、存储、ACME 和日志配置。
 type Config struct {
-	Server  ServerConfig  `yaml:"server"`
-	Auth    AuthConfig    `yaml:"auth"`
-	Storage StorageConfig `yaml:"storage"`
-	Acme    AcmeConfig    `yaml:"acme"`
-	Log     LogConfig     `yaml:"log"`
+	Server        ServerConfig        `yaml:"server"`
+	Auth          AuthConfig          `yaml:"auth"`
+	Storage       StorageConfig       `yaml:"storage"`
+	Acme          AcmeConfig          `yaml:"acme"`
+	Log           LogConfig           `yaml:"log"`
+	Scheduler     SchedulerConfig     `yaml:"scheduler"`
+	Observability ObservabilityConfig `yaml:"observability"`
 }
 
 // ServerConfig 定义 HTTP 服务器的配置项。
 type ServerConfig struct {
-	Listen    string `yaml:"listen"`
-	TLS       bool   `yaml:"tls"`
-	CertFile  string `yaml:"cert_file"`
-	KeyFile   string `yaml:"key_file"`
-	BaseURL   string `yaml:"base_url"`
+	Listen   string `yaml:"listen"`
+	TLS      bool   `yaml:"tls"`
+	CertFile string `yaml:"cert_file"`
+	KeyFile  string `yaml:"key_file"`
+	BaseURL  string `yaml:"base_url"`
+	// 以下超时对应 http.Server 的同名字段，0 表示不限制。
+	ReadHeaderTimeout time.Duration `yaml:"read_header_timeout"`
+	ReadTimeout       time.Duration `yaml:"read_timeout"`
+	WriteTimeout      time.Duration `yaml:"write_timeout"`
+	IdleTimeout       time.Duration `yaml:"idle_timeout"`
+}
+
+// SchedulerConfig 定义证书续期调度器的配置项。
+type SchedulerConfig struct {
+	Enabled  bool          `yaml:"enabled"`
+	Interval time.Duration `yaml:"interval"`
+	Jitter   time.Duration `yaml:"jitter"`
+}
+
+// ObservabilityConfig 定义可观测性端点（指标与就绪检查）的配置项。
+type ObservabilityConfig struct {
+	MetricsEnabled bool `yaml:"metrics_enabled"`
+	ReadyEnabled   bool `yaml:"ready_enabled"`
 }
 
 // AuthConfig 定义认证相关的配置项。
@@ -65,14 +85,18 @@ type LogConfig struct {
 func Default() *Config {
 	return &Config{
 		Server: ServerConfig{
-			Listen:  ":8443",
-			TLS:     false,
-			BaseURL: "http://localhost:8443",
+			Listen:            ":8443",
+			TLS:               false,
+			BaseURL:           "http://localhost:8443",
+			ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout:       30 * time.Second,
+			WriteTimeout:      120 * time.Second,
+			IdleTimeout:       60 * time.Second,
 		},
 		Auth: AuthConfig{
 			TimestampWindowSec: 300,
-			NonceTTLSec:       300,
-			AdminTokenID:      "admin",
+			NonceTTLSec:        300,
+			AdminTokenID:       "admin",
 		},
 		Storage: StorageConfig{
 			SQLitePath:    "/data/db/certkeeper.db",
@@ -93,6 +117,15 @@ func Default() *Config {
 			File:       "/data/logs/certkeeper.log",
 			MaxSizeMB:  10,
 			MaxBackups: 3,
+		},
+		Scheduler: SchedulerConfig{
+			Enabled:  true,
+			Interval: 12 * time.Hour,
+			Jitter:   1 * time.Hour,
+		},
+		Observability: ObservabilityConfig{
+			MetricsEnabled: true,
+			ReadyEnabled:   true,
 		},
 	}
 }
@@ -167,6 +200,21 @@ func (c *Config) Validate() error {
 		if c.Server.CertFile == "" || c.Server.KeyFile == "" {
 			return fmt.Errorf("启用 TLS 时 cert_file 和 key_file 必填")
 		}
+	}
+	if c.Server.ReadHeaderTimeout < 0 || c.Server.ReadTimeout < 0 || c.Server.WriteTimeout < 0 || c.Server.IdleTimeout < 0 {
+		return fmt.Errorf("server 各项超时不能为负数")
+	}
+	if c.Server.ReadTimeout > 0 && c.Server.ReadHeaderTimeout > c.Server.ReadTimeout {
+		return fmt.Errorf("server.read_header_timeout 不能大于 server.read_timeout")
+	}
+	if c.Scheduler.Interval <= 0 {
+		return fmt.Errorf("scheduler.interval 必须大于 0")
+	}
+	if c.Scheduler.Jitter < 0 {
+		return fmt.Errorf("scheduler.jitter 不能为负数")
+	}
+	if c.Scheduler.Jitter >= c.Scheduler.Interval {
+		return fmt.Errorf("scheduler.jitter 必须小于 scheduler.interval")
 	}
 	return nil
 }

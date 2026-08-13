@@ -18,6 +18,8 @@ const (
 	HeaderNonce = "X-CK-Nonce"
 	// HeaderSignature 是用于传递 HMAC 签名的 HTTP 请求头名称。
 	HeaderSignature = "X-CK-Signature"
+	// HeaderBodyHash 是用于传递请求体 SHA-256 摘要的 HTTP 请求头名称。
+	HeaderBodyHash = "X-CK-BodyHash"
 	// HeaderClientToken 是客户端 Token 的标准 Authorization 请求头名称。
 	HeaderClientToken = "Authorization"
 
@@ -27,6 +29,16 @@ const (
 	TokenIDLen = 12
 	// SecretLen 定义密钥的字节长度。
 	SecretLen = 32
+	// TokenIDMaxLen 定义请求头中 Token ID 的最大字节长度。
+	TokenIDMaxLen = 64
+	// TimestampMaxLen 定义时间戳十进制字符串的最大长度。
+	TimestampMaxLen = 20
+	// NonceHexLen 定义 nonce 十六进制字符串的固定长度。
+	NonceHexLen = NonceLen * 2
+	// HashHexLen 定义 SHA-256 十六进制字符串的固定长度。
+	HashHexLen = 64
+	// EmptyBodyHash 是空请求体使用的协议摘要值。
+	EmptyBodyHash = "0"
 )
 
 // Now 返回当前时间的 Unix 时间戳（秒）。

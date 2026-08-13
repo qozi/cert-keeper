@@ -125,6 +125,14 @@ func (c *cli) dispatch(args []string) error {
 		return c.client(args[1:])
 	case "log":
 		return c.log(args[1:])
+	case "grant":
+		return c.grant(args[1:])
+	case "job":
+		return c.job(args[1:])
+	case "generation":
+		return c.generation(args[1:])
+	case "audit":
+		return c.audit(args[1:])
 	case "help", "-h", "--help":
 		printUsage(c.out)
 		return nil
@@ -595,6 +603,176 @@ func (c *cli) log(args []string) error {
 	return c.print(result)
 }
 
+// certificatePermissions 是 v2 授权支持的证书权限列表，与 internal/store 保持一致。
+var certificatePermissions = []string{"apply", "status", "read_cert", "read_private_key", "force"}
+
+// validatePermission 校验证书权限值，非法时报错并列出合法值。
+func validatePermission(permission string) error {
+	for _, valid := range certificatePermissions {
+		if permission == valid {
+			return nil
+		}
+	}
+	return fmt.Errorf("无效的权限: %s，合法值为: %s", permission, strings.Join(certificatePermissions, "/"))
+}
+
+func (c *cli) grant(args []string) error {
+	if len(args) == 0 {
+		return errors.New("grant 需要子命令：add/remove/list")
+	}
+	switch args[0] {
+	case "add", "remove":
+		fs := c.flagSet("grant " + args[0])
+		tokenID, domain, permission := "", "", ""
+		fs.StringVar(&tokenID, "token", "", "Token ID")
+		fs.StringVar(&domain, "domain", "", "域名")
+		fs.StringVar(&permission, "permission", "", "权限：apply/status/read_cert/read_private_key/force")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if tokenID == "" || domain == "" || permission == "" {
+			return fmt.Errorf("grant %s 需要 --token ID、--domain DOMAIN 和 --permission PERMISSION", args[0])
+		}
+		if err := validatePermission(permission); err != nil {
+			return err
+		}
+		var err error
+		if args[0] == "add" {
+			err = c.st.Grant(c.ctx, tokenID, domain, permission)
+		} else {
+			err = c.st.Revoke(c.ctx, tokenID, domain, permission)
+		}
+		if err != nil {
+			return err
+		}
+		return c.print(map[string]any{"ok": true})
+	case "list":
+		fs := c.flagSet("grant list")
+		tokenID := ""
+		fs.StringVar(&tokenID, "token", "", "Token ID")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if tokenID == "" {
+			return errors.New("grant list 需要 --token ID")
+		}
+		result, err := c.st.ListGrants(c.ctx, tokenID)
+		if err != nil {
+			return err
+		}
+		return c.print(result)
+	default:
+		return fmt.Errorf("未知 grant 子命令: %s", args[0])
+	}
+}
+
+func (c *cli) job(args []string) error {
+	if len(args) == 0 {
+		return errors.New("job 需要子命令：list/show")
+	}
+	switch args[0] {
+	case "list":
+		fs := c.flagSet("job list")
+		domain, status := "", ""
+		limit := 100
+		fs.StringVar(&domain, "domain", "", "域名过滤")
+		fs.StringVar(&status, "status", "", "状态过滤：queued/running/succeeded/failed/cancelled")
+		fs.IntVar(&limit, "limit", 100, "数量")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		result, err := c.st.ListCertificateJobs(c.ctx, store.JobFilter{Domain: domain, Status: status, Limit: limit})
+		if err != nil {
+			return err
+		}
+		return c.print(result)
+	case "show":
+		fs := c.flagSet("job show")
+		id := ""
+		fs.StringVar(&id, "id", "", "任务 ID")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if id == "" {
+			return errors.New("job show 需要 --id ID")
+		}
+		result, err := c.st.GetCertificateJob(c.ctx, id)
+		if err != nil {
+			return err
+		}
+		if result == nil {
+			return fmt.Errorf("任务不存在: %s", id)
+		}
+		return c.print(result)
+	default:
+		return fmt.Errorf("未知 job 子命令: %s", args[0])
+	}
+}
+
+func (c *cli) generation(args []string) error {
+	if len(args) == 0 {
+		return errors.New("generation 需要子命令：list/deployments")
+	}
+	switch args[0] {
+	case "list":
+		fs := c.flagSet("generation list")
+		domain := ""
+		fs.StringVar(&domain, "domain", "", "域名")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if domain == "" {
+			return errors.New("generation list 需要 --domain DOMAIN")
+		}
+		result, err := c.st.ListCertificateGenerations(c.ctx, domain)
+		if err != nil {
+			return err
+		}
+		// 私钥引用属于敏感信息，不在 CLI 输出中展示。
+		for i := range result {
+			result[i].PrivateKeyRef = store.JSONNullString{}
+		}
+		return c.print(result)
+	case "deployments":
+		fs := c.flagSet("generation deployments")
+		id := int64(0)
+		fs.Int64Var(&id, "id", 0, "generation 数据库 ID")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if id <= 0 {
+			return errors.New("generation deployments 需要 --id N（generation 数据库 ID）")
+		}
+		result, err := c.st.ListDeploymentReports(c.ctx, id)
+		if err != nil {
+			return err
+		}
+		return c.print(result)
+	default:
+		return fmt.Errorf("未知 generation 子命令: %s", args[0])
+	}
+}
+
+func (c *cli) audit(args []string) error {
+	if len(args) == 0 || args[0] != "list" {
+		return errors.New("audit 目前只支持 list")
+	}
+	fs := c.flagSet("audit list")
+	domain, actor := "", ""
+	limit := 100
+	fs.StringVar(&domain, "domain", "", "域名过滤")
+	fs.StringVar(&actor, "actor", "", "操作者 Token ID 过滤")
+	fs.IntVar(&limit, "limit", 100, "数量")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	result, err := c.st.ListAuditEvents(c.ctx, store.AuditFilter{Domain: domain, ActorTokenID: actor, Limit: limit})
+	if err != nil {
+		return err
+	}
+	return c.print(result)
+}
+
 func (c *cli) flagSet(name string) *flag.FlagSet {
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	fs.SetOutput(c.errOut)
@@ -723,6 +901,10 @@ func printUsage(out io.Writer) {
   provider   list/parameters
   client     list
   log        list
+  grant      add/remove/list
+  job        list/show
+  generation list/deployments
+  audit      list
 
 示例:
   certk-server-cli cert-config set -d example.com --mode dns_api --dns-provider dns_cf

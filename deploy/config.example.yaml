@@ -7,6 +7,11 @@ server:
   cert_file: ""             # tls=true 时必填
   key_file: ""              # tls=true 时必填
   base_url: "https://ck.example.com:3780"
+  # 以下超时对应 http.Server 同名字段，0 表示不限制
+  read_header_timeout: 10s  # 读取请求头超时（不能大于 read_timeout）
+  read_timeout: 30s         # 读取整个请求的超时
+  write_timeout: 120s       # 写响应超时（签发轮询等长请求需足够大）
+  idle_timeout: 60s         # keep-alive 空闲连接超时
 
 auth:
   timestamp_window_sec: 300  # 客户端时间戳允许误差
@@ -34,3 +39,12 @@ log:
   file: "/data/logs/certkeeper.log"
   max_size_mb: 10
   max_backups: 3
+
+scheduler:
+  enabled: true               # 是否启用服务端续期调度器（自动对预置证书执行 reconcile）
+  interval: 12h               # 调度轮询间隔，必须大于 0
+  jitter: 1h                  # 每轮随机抖动，避免多实例同时触发；必须小于 interval
+
+observability:
+  metrics_enabled: true       # 暴露 /metrics（Prometheus 文本格式）
+  ready_enabled: true         # 暴露 /readyz 就绪检查（docker-compose healthcheck 依赖此项）

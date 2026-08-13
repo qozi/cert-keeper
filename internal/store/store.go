@@ -5,9 +5,11 @@ package store
 import (
 	"database/sql"
 	"embed"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -18,13 +20,22 @@ var migrationsFS embed.FS
 
 // Store 是数据存储的核心结构，封装 SQLite 数据库连接。
 type Store struct {
-	DB *sql.DB
+	DB  *sql.DB
+	kek []byte
 }
 
 // Open 打开或创建指定路径的 SQLite 数据库，并执行必要的迁移。
 func Open(path string) (*Store, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("创建数据库目录失败: %w", err)
+	}
+	if err := chmodIfSupported(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("收紧数据库目录权限失败: %w", err)
+	}
+	kek, err := loadOrCreateKEK(path + ".kek")
+	if err != nil {
+		return nil, fmt.Errorf("加载数据库密钥失败: %w", err)
 	}
 	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)", path)
 	db, err := sql.Open("sqlite", dsn)
@@ -33,10 +44,16 @@ func Open(path string) (*Store, error) {
 	}
 	db.SetMaxOpenConns(1) // SQLite 写并发友好
 	if err := db.Ping(); err != nil {
+		_ = db.Close()
 		return nil, fmt.Errorf("ping SQLite 失败: %w", err)
 	}
-	s := &Store{DB: db}
+	s := &Store{DB: db, kek: kek}
 	if err := s.migrate(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := secureDatabaseFiles(path); err != nil {
+		_ = db.Close()
 		return nil, err
 	}
 	return s, nil
@@ -73,6 +90,10 @@ func (s *Store) migrate() error {
 		if err != nil {
 			return err
 		}
+		if _, err := tx.Exec(`PRAGMA defer_foreign_keys = ON`); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
 		if _, err := tx.Exec(string(data)); err != nil {
 			_ = tx.Rollback()
 			return fmt.Errorf("执行迁移 %s 失败: %w", name, err)
@@ -86,4 +107,21 @@ func (s *Store) migrate() error {
 		}
 	}
 	return nil
+}
+
+// secureDatabaseFiles 收紧 SQLite 主文件及其 WAL/SHM 辅助文件的访问权限。
+func secureDatabaseFiles(path string) error {
+	for _, file := range []string{path, path + "-wal", path + "-shm"} {
+		if err := chmodIfSupported(file, 0o600); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("收紧数据库文件权限失败: %w", err)
+		}
+	}
+	return nil
+}
+
+func chmodIfSupported(path string, mode os.FileMode) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	return os.Chmod(path, mode)
 }

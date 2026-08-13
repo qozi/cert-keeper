@@ -4,6 +4,7 @@ package client
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -14,17 +15,18 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/siidoo/certkeeper/pkg/certproto"
 	"github.com/siidoo/certkeeper/pkg/ckauth"
 )
 
 // Config 定义客户端的配置。
 type Config struct {
-	Server     string `yaml:"server"`
-	TokenID    string `yaml:"token_id"`
-	TokenSecret string `yaml:"token_secret"`
-	LogFile    string `yaml:"log_file"`
-	LogLevel   string `yaml:"log_level"`
-	Defaults   Defaults `yaml:"defaults"`
+	Server      string   `yaml:"server"`
+	TokenID     string   `yaml:"token_id"`
+	TokenSecret string   `yaml:"token_secret"`
+	LogFile     string   `yaml:"log_file"`
+	LogLevel    string   `yaml:"log_level"`
+	Defaults    Defaults `yaml:"defaults"`
 }
 
 // Defaults 定义客户端的默认配置。
@@ -88,6 +90,11 @@ type applyResp struct {
 }
 
 func (c *Client) doRequest(method, path string, body any) (*http.Response, []byte, error) {
+	return c.doRequestCtx(context.Background(), method, path, body)
+}
+
+// doRequestCtx 发送带 HMAC 签名的请求，并支持通过 ctx 取消。
+func (c *Client) doRequestCtx(ctx context.Context, method, path string, body any) (*http.Response, []byte, error) {
 	var bodyBytes []byte
 	var bodyHash = "0"
 	if body != nil {
@@ -101,7 +108,7 @@ func (c *Client) doRequest(method, path string, body any) (*http.Response, []byt
 		return nil, nil, err
 	}
 	sig := ckauth.Sign(method, path, ts, nonce, bodyHash, c.Cfg.TokenSecret)
-	req, err := http.NewRequest(method, c.Cfg.Server+path, bytes.NewReader(bodyBytes))
+	req, err := http.NewRequestWithContext(ctx, method, c.Cfg.Server+path, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -160,7 +167,7 @@ func (c *Client) Apply(opts ApplyOpts) error {
 
 	// 下载文件
 	outDir := opts.OutDir
-	if err := os.MkdirAll(outDir, 0o755); err != nil {
+	if err := os.MkdirAll(outDir, 0o700); err != nil {
 		return fmt.Errorf("创建输出目录失败: %w", err)
 	}
 	nameMap := map[string]string{
@@ -170,12 +177,22 @@ func (c *Client) Apply(opts ApplyOpts) error {
 		"ca.pem":        opts.CAFile,
 		"time.log":      "time.log",
 	}
+	seenFiles := make(map[string]struct{}, len(ar.Files))
+	for _, f := range ar.Files {
+		if err := certproto.ValidateFileName(f.Name); err != nil {
+			return fmt.Errorf("服务端返回了不允许的文件名 %q: %w", f.Name, err)
+		}
+		if _, exists := seenFiles[f.Name]; exists {
+			return fmt.Errorf("服务端返回了重复文件 %q", f.Name)
+		}
+		seenFiles[f.Name] = struct{}{}
+	}
 	// 备份旧文件用于回滚
 	backups := map[string]string{}
 	for _, f := range ar.Files {
 		outName := nameMap[f.Name]
 		if outName == "" {
-			outName = f.Name
+			return fmt.Errorf("服务端返回了未映射文件 %q", f.Name)
 		}
 		outPath := filepath.Join(outDir, outName)
 		// 备份
@@ -188,10 +205,14 @@ func (c *Client) Apply(opts ApplyOpts) error {
 		}
 		// 下载
 		path := fmt.Sprintf("/api/v1/certs/%s/files/%s", opts.Domain, f.Name)
-		_, data, err := c.doRequest(http.MethodGet, path, nil)
+		resp, data, err := c.doRequest(http.MethodGet, path, nil)
 		if err != nil {
 			c.restoreBackups(backups)
 			return fmt.Errorf("下载 %s 失败: %w", f.Name, err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			c.restoreBackups(backups)
+			return fmt.Errorf("下载 %s 失败: 服务端返回 %d: %s", f.Name, resp.StatusCode, string(data))
 		}
 		// 校验 SHA256
 		h := sha256.Sum256(data)
@@ -206,11 +227,6 @@ func (c *Client) Apply(opts ApplyOpts) error {
 		}
 		c.Log.Info("下载完成", "file", outPath, "size", f.Size)
 	}
-	// 清理备份
-	for _, bk := range backups {
-		_ = os.Remove(bk)
-	}
-
 	// 校验命令
 	if opts.VerifyCmd != "" {
 		c.Log.Info("执行校验命令", "cmd", opts.VerifyCmd)
@@ -219,6 +235,10 @@ func (c *Client) Apply(opts ApplyOpts) error {
 			c.restoreBackups(backups)
 			return fmt.Errorf("校验失败: %w", err)
 		}
+	}
+	// 仅在校验成功后清理备份，确保校验失败时仍可回滚。
+	for _, bk := range backups {
+		_ = os.Remove(bk)
 	}
 	// reload 命令
 	if opts.ReloadCmd != "" {
@@ -254,6 +274,9 @@ func (c *Client) Status(domain string) error {
 
 // Download 下载单个证书文件。
 func (c *Client) Download(domain, fileName, outPath string) error {
+	if err := certproto.ValidateFileName(fileName); err != nil {
+		return fmt.Errorf("不允许下载文件 %q: %w", fileName, err)
+	}
 	path := fmt.Sprintf("/api/v1/certs/%s/files/%s", domain, fileName)
 	resp, data, err := c.doRequest(http.MethodGet, path, nil)
 	if err != nil {

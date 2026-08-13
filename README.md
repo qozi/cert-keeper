@@ -276,6 +276,30 @@ DNS Secret 由服务端按 `provider` 名分组加密存储；acme.sh 调用时�
 - 服务端自身 TLS 证书建议由反向代理（nginx/Caddy）终止；如需服务端直接暴露 HTTPS，在配置中开启 `tls` 并指定证书路径（可先用 acme.sh 为服务端自身域名签一张）。
 - DNS 手动模式（`dns_manual`）无自动续签，仅用于一次性签发。
 
+## v2 说明
+
+v2 引入 generation 证书模型与更严格的授权：服务端将每次签发结果发布为不可变 generation
+（`<certs_dir>/<domain>/generations/<gen>/` + 原子 `current` 指针），客户端按 manifest
+校验后原子部署到本地 `releases/<gen>/` + `current` 布局，verify 失败自动回滚。
+
+- **客户端默认走 v2**：`certkeeper-client apply/status/download` 默认使用 v2 流程；
+  服务端不支持时自动回退 v1，也可用 `--v1` 强制旧流程。
+- **grant 必需**：v2 授权为 deny-by-default，按 `(token, domain, permission)` 检查，
+  admin 也不绕过。调用前需先授权：
+  `certk-server-cli grant add --token <id> --domain <d> --permission apply`
+  （权限：`apply/status/read_cert/read_private_key/force`，详见 docs/operations.md）。
+- **v2 路由**（均需 client token）：
+  `POST /api/v2/certs/{domain}/reconcile`、`GET /api/v2/certs/{domain}/status`、
+  `GET /api/v2/certs/{domain}/generations/{gen}/manifest`、`GET .../files/{name}`、
+  `POST /api/v2/certs/{domain}/deployments`、`GET /api/v2/jobs/{job_id}`。
+- **新增配置段**（见 deploy/config.example.yaml）：
+  - `server.read_header_timeout/read_timeout/write_timeout/idle_timeout`：HTTP 超时；
+  - `scheduler`（`enabled/interval/jitter`）：服务端续期调度器，自动对预置证书执行 reconcile；
+  - `observability`（`metrics_enabled/ready_enabled`）：`/metrics` 与 `/readyz` 端点。
+- **行为变化**：服务端启动时不再自动升级 acme.sh（版本固定在镜像构建期）；
+  compose 中 `CK_ENCRYPTION_KEY` 必须显式提供，无默认值；healthcheck 改用 `/readyz`。
+- 详细文档：[安全模型](docs/security.md)、[运维手册](docs/operations.md)。
+
 ## 相关文档
 
 - [发布指南](docs/releasing.md)

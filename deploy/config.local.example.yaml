@@ -7,6 +7,11 @@ server:
   listen: "127.0.0.1:3780"   # 仅监听本机，避免暴露到外网
   tls: false
   base_url: "http://127.0.0.1:3780"
+  # HTTP 超时，0 表示不限制；read_header_timeout 不能大于 read_timeout
+  read_header_timeout: 10s
+  read_timeout: 30s
+  write_timeout: 120s
+  idle_timeout: 60s
 
 auth:
   timestamp_window_sec: 300
@@ -33,3 +38,12 @@ log:
   file: ""                   # 留空输出到 stdout，便于 go run 直接查看
   max_size_mb: 10
   max_backups: 3
+
+scheduler:
+  enabled: true              # 本地调试可改为 false 关闭自动续期调度
+  interval: 12h              # 调度轮询间隔
+  jitter: 1h                 # 随机抖动，必须小于 interval
+
+observability:
+  metrics_enabled: true      # 暴露 /metrics
+  ready_enabled: true        # 暴露 /readyz

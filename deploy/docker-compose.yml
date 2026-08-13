@@ -14,10 +14,14 @@ services:
     volumes:
       - ./data:/data
     environment:
-      - CK_ENCRYPTION_KEY=${CK_ENCRYPTION_KEY:-please-change-me-32-bytes-or-more}
+      # 加密主密钥必须显式提供，无默认值：请先在 deploy/.env 中设置
+      # CK_ENCRYPTION_KEY（可用 certk-server --gen-encryption-key 生成）。
+      # admin token 的 secret 由该密钥派生，同样不允许使用公开默认值。
+      - CK_ENCRYPTION_KEY=${CK_ENCRYPTION_KEY:?必须在 .env 中设置 CK_ENCRYPTION_KEY（certk-server --gen-encryption-key 生成）}
       - TZ=Asia/Shanghai
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8443/healthz"]
+      # /readyz 默认开启（observability.ready_enabled），任一就绪检查失败返回 503
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8443/readyz"]
       interval: 30s
       timeout: 5s
       retries: 3

@@ -8,9 +8,11 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/siidoo/certkeeper/internal/acme"
+	"github.com/siidoo/certkeeper/internal/certstore"
 	"github.com/siidoo/certkeeper/internal/config"
 	"github.com/siidoo/certkeeper/internal/lock"
 	"github.com/siidoo/certkeeper/internal/store"
@@ -32,6 +34,13 @@ type Service struct {
 	Cfg       *config.Config
 	Store     *store.Store
 	IssueFunc IssueFunc
+	// V2Issuer 是可注入的 v2 签发器；为 nil 时使用基于 acme.Runner 的默认实现。
+	V2Issuer V2Issuer
+
+	v2csOnce sync.Once
+	v2cs     *certstore.Store
+	v2csErr  error
+	v2Locks  sync.Map // 域名 -> *sync.Mutex 的每域名互斥锁
 }
 
 // New 创建服务操作对象。

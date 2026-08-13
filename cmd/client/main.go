@@ -3,6 +3,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -20,9 +22,9 @@ import (
 
 func main() {
 	var (
-		command   string
+		command    string
 		configPath string
-		quiet     bool
+		quiet      bool
 	)
 	if len(os.Args) < 2 {
 		printUsage()
@@ -88,11 +90,11 @@ func main() {
 
 // 包级全局变量（被各子命令 fs 与 applyGlobalOverrides 共用）
 var (
-	server    string
-	tokenID   string
-	secret    string
-	logFile   string
-	logLevel  string
+	server   string
+	tokenID  string
+	secret   string
+	logFile  string
+	logLevel string
 )
 
 func scanConfigArg(args []string) string {
@@ -193,20 +195,32 @@ func printUsage() {
   --version       显示版本
 
 apply flags:
-  -d DOMAIN       主域名（必填，可多次指定）
-  --mode M        dns_api/standalone/webroot/dns_manual
-  --dns-provider P   dns_api 模式
-  --webroot P     webroot 模式
-  --ca C          letsencrypt/zerossl
-  --keylength L   ec-256/rsa-2048
+  -d DOMAIN       主域名（必填，可多次指定；附加域名仅 v1 生效）
+  --v1            强制使用 v1 旧流程（默认 v2，服务端不支持时自动回退）
+  --mode M        dns_api/standalone/webroot/dns_manual（仅 v1）
+  --dns-provider P   dns_api 模式（仅 v1）
+  --webroot P     webroot 模式（仅 v1）
+  --ca C          letsencrypt/zerossl（仅 v1）
+  --keylength L   ec-256/rsa-2048（仅 v1）
   --out-dir D     证书下载保存目录（默认 /etc/certkeeper/certs）
-  --cert-file F   cert 文件名（默认 cert.pem）
-  --key-file F    key 文件名（默认 key.pem）
-  --fullchain-file F
-  --ca-file F
-  --reload-cmd C  下载后 reload 命令
-  --verify-cmd C  下载后 verify 命令（在 reload 前）
-  --force         即使未到期也强制重新下载
+  --cert-file F   cert 文件名（默认 cert.pem，仅 v1）
+  --key-file F    key 文件名（默认 key.pem，仅 v1）
+  --fullchain-file F（仅 v1）
+  --ca-file F（仅 v1）
+  --reload-cmd C  部署后 reload 命令
+  --verify-cmd C  部署后 verify 命令（在 reload 前）
+  --force         强制重新签发（v2 仅管理员）/重新下载（v1）
+
+status flags:
+  -d DOMAIN       主域名（必填）
+  --v1            强制使用 v1 旧流程（默认 v2，服务端不支持时自动回退）
+
+download flags:
+  -d DOMAIN       主域名（必填）
+  -f FILE         文件名 (cert.pem/key.pem/fullchain.pem/ca.pem/time.log)
+  -o PATH         输出路径
+  -g GEN          v2 generation（默认取服务端 current，仅 v2）
+  --v1            强制使用 v1 旧流程（默认 v2，服务端不支持时自动回退）
 
 示例:
   certkeeper-client apply -d example.com --out-dir /etc/nginx/certs \
@@ -235,37 +249,39 @@ func runApply(cli *client.Client, args []string, logger *slog.Logger, makeGlobal
 	fs := flag.NewFlagSet("apply", flag.ExitOnError)
 	makeGlobal(fs)
 	var (
-		domain     stringSlice
-		san        stringSlice
-		mode       string
+		domain      stringSlice
+		san         stringSlice
+		mode        string
 		dnsProvider string
-		webroot    string
-		ca         string
-		keylength  string
-		outDir     string
-		certFile   string
-		keyFile    string
-		fullchain  string
-		caFile     string
-		verifyCmd  string
-		reloadCmd  string
-		force      bool
+		webroot     string
+		ca          string
+		keylength   string
+		outDir      string
+		certFile    string
+		keyFile     string
+		fullchain   string
+		caFile      string
+		verifyCmd   string
+		reloadCmd   string
+		force       bool
+		useV1       bool
 	)
 	fs.Var(&domain, "d", "主域名")
-	fs.Var(&san, "san", "附加域名（可多次指定）")
-	fs.StringVar(&mode, "mode", "", "challenge 模式")
-	fs.StringVar(&dnsProvider, "dns-provider", "", "dns provider")
-	fs.StringVar(&webroot, "webroot", "", "webroot 路径")
-	fs.StringVar(&ca, "ca", "", "CA")
-	fs.StringVar(&keylength, "keylength", "", "密钥长度")
+	fs.Var(&san, "san", "附加域名（可多次指定，仅 v1）")
+	fs.StringVar(&mode, "mode", "", "challenge 模式（仅 v1）")
+	fs.StringVar(&dnsProvider, "dns-provider", "", "dns provider（仅 v1）")
+	fs.StringVar(&webroot, "webroot", "", "webroot 路径（仅 v1）")
+	fs.StringVar(&ca, "ca", "", "CA（仅 v1）")
+	fs.StringVar(&keylength, "keylength", "", "密钥长度（仅 v1）")
 	fs.StringVar(&outDir, "out-dir", "", "输出目录")
-	fs.StringVar(&certFile, "cert-file", "", "cert 文件名")
-	fs.StringVar(&keyFile, "key-file", "", "key 文件名")
-	fs.StringVar(&fullchain, "fullchain-file", "", "fullchain 文件名")
-	fs.StringVar(&caFile, "ca-file", "", "ca 文件名")
+	fs.StringVar(&certFile, "cert-file", "", "cert 文件名（仅 v1）")
+	fs.StringVar(&keyFile, "key-file", "", "key 文件名（仅 v1）")
+	fs.StringVar(&fullchain, "fullchain-file", "", "fullchain 文件名（仅 v1）")
+	fs.StringVar(&caFile, "ca-file", "", "ca 文件名（仅 v1）")
 	fs.StringVar(&verifyCmd, "verify-cmd", "", "校验命令")
 	fs.StringVar(&reloadCmd, "reload-cmd", "", "reload 命令")
-	fs.BoolVar(&force, "force", false, "强制重新下载")
+	fs.BoolVar(&force, "force", false, "强制重新签发/下载")
+	fs.BoolVar(&useV1, "v1", false, "强制使用 v1 旧流程")
 	_ = fs.Parse(args)
 
 	applyGlobalOverrides(cli, server, tokenID, secret, logFile, logLevel)
@@ -302,7 +318,7 @@ func runApply(cli *client.Client, args []string, logger *slog.Logger, makeGlobal
 	if reloadCmd == "" {
 		reloadCmd = cfg.Defaults.ReloadCmd
 	}
-	opts := client.ApplyOpts{
+	v1Opts := client.ApplyOpts{
 		Domain:        domain[0],
 		SAN:           append(append([]string{}, domain[1:]...), san...),
 		ChallengeMode: mode,
@@ -319,23 +335,49 @@ func runApply(cli *client.Client, args []string, logger *slog.Logger, makeGlobal
 		ReloadCmd:     reloadCmd,
 		Force:         force,
 	}
-	if err := cli.Apply(opts); err != nil {
+	v2Opts := client.ApplyV2Opts{
+		Domain:    domain[0],
+		OutDir:    outDir,
+		VerifyCmd: verifyCmd,
+		ReloadCmd: reloadCmd,
+		Force:     force,
+	}
+	if err := applyAuto(cli, v2Opts, v1Opts, useV1); err != nil {
 		logger.Error("apply 失败", "err", err)
 		os.Exit(1)
 	}
+}
+
+// applyAuto 默认走 v2 reconcile + generation 原子部署；服务端不支持 v2 时回退 v1。
+// useV1 为 true 时强制使用 v1 旧流程。
+func applyAuto(cli *client.Client, v2Opts client.ApplyV2Opts, v1Opts client.ApplyOpts, useV1 bool) error {
+	if useV1 {
+		return cli.Apply(v1Opts)
+	}
+	err := cli.ApplyV2(context.Background(), v2Opts)
+	if errors.Is(err, client.ErrV2NotSupported) {
+		fmt.Fprintln(os.Stderr, "提示: 服务端不支持 v2 API，回退到 v1 申请流程")
+		return cli.Apply(v1Opts)
+	}
+	return err
 }
 
 func runDownload(cli *client.Client, args []string, makeGlobal globalRegFn) {
 	fs := flag.NewFlagSet("download", flag.ExitOnError)
 	makeGlobal(fs)
 	var (
-		domain string
-		file   string
-		out    string
+		domain     string
+		file       string
+		out        string
+		generation string
+		useV1      bool
 	)
 	fs.StringVar(&domain, "d", "", "域名")
 	fs.StringVar(&file, "f", "", "文件名 (cert/key/fullchain/ca/time.log)")
 	fs.StringVar(&out, "o", "", "输出路径")
+	fs.StringVar(&generation, "g", "", "v2 generation（默认取服务端 current）")
+	fs.StringVar(&generation, "generation", "", "v2 generation（默认取服务端 current）")
+	fs.BoolVar(&useV1, "v1", false, "强制使用 v1 旧流程")
 	_ = fs.Parse(args)
 	applyGlobalOverrides(cli, server, tokenID, secret, logFile, logLevel)
 	if err := requireAuth(cli); err != nil {
@@ -346,17 +388,35 @@ func runDownload(cli *client.Client, args []string, makeGlobal globalRegFn) {
 		fmt.Fprintln(os.Stderr, "download 需要 -d -f -o")
 		os.Exit(1)
 	}
-	if err := cli.Download(domain, file, out); err != nil {
+	if err := downloadAuto(cli, domain, generation, file, out, useV1); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
 
+// downloadAuto 默认走 v2 下载；服务端不支持 v2 时回退 v1。
+// useV1 为 true 时强制使用 v1 旧流程。
+func downloadAuto(cli *client.Client, domain, generation, fileName, outPath string, useV1 bool) error {
+	if useV1 {
+		return cli.Download(domain, fileName, outPath)
+	}
+	err := cli.DownloadV2(domain, generation, fileName, outPath)
+	if errors.Is(err, client.ErrV2NotSupported) {
+		fmt.Fprintln(os.Stderr, "提示: 服务端不支持 v2 API，回退到 v1 下载流程")
+		return cli.Download(domain, fileName, outPath)
+	}
+	return err
+}
+
 func runStatus(cli *client.Client, args []string, makeGlobal globalRegFn) {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
 	makeGlobal(fs)
-	var domain string
+	var (
+		domain string
+		useV1  bool
+	)
 	fs.StringVar(&domain, "d", "", "域名")
+	fs.BoolVar(&useV1, "v1", false, "强制使用 v1 旧流程")
 	_ = fs.Parse(args)
 	applyGlobalOverrides(cli, server, tokenID, secret, logFile, logLevel)
 	if err := requireAuth(cli); err != nil {
@@ -367,10 +427,24 @@ func runStatus(cli *client.Client, args []string, makeGlobal globalRegFn) {
 		fmt.Fprintln(os.Stderr, "status 需要 -d")
 		os.Exit(1)
 	}
-	if err := cli.Status(domain); err != nil {
+	if err := statusAuto(cli, domain, useV1); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+// statusAuto 默认走 v2 状态查询；服务端不支持 v2 时回退 v1。
+// useV1 为 true 时强制使用 v1 旧流程。
+func statusAuto(cli *client.Client, domain string, useV1 bool) error {
+	if useV1 {
+		return cli.Status(domain)
+	}
+	err := cli.StatusV2(domain)
+	if errors.Is(err, client.ErrV2NotSupported) {
+		fmt.Fprintln(os.Stderr, "提示: 服务端不支持 v2 API，回退到 v1 状态查询")
+		return cli.Status(domain)
+	}
+	return err
 }
 
 func runRegister(cli *client.Client, args []string, makeGlobal globalRegFn) {
