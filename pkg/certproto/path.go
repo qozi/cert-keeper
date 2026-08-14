@@ -16,6 +16,41 @@ const (
 	FilesPathSegment = "files"
 	// JobsPathSegment 是任务资源的 URL 路径段。
 	JobsPathSegment = "jobs"
+	// CapabilitiesPathSegment 是能力发现资源的 URL 路径段。
+	CapabilitiesPathSegment = "capabilities"
+	// ReconcilePathSegment 是 reconcile 操作的 URL 路径段。
+	ReconcilePathSegment = "reconcile"
+	// StatusPathSegment 是证书状态资源的 URL 路径段。
+	StatusPathSegment = "status"
+	// ManifestPathSegment 是 manifest 资源的 URL 路径段。
+	ManifestPathSegment = "manifest"
+	// DeploymentsPathSegment 是部署回报资源的 URL 路径段。
+	DeploymentsPathSegment = "deployments"
+)
+
+const (
+	// CapabilitiesURL 是能力发现端点。
+	CapabilitiesURL = V2APIPath + "/" + CapabilitiesPathSegment
+	// JobsURL 是任务资源集合端点。
+	JobsURL = V2APIPath + "/" + JobsPathSegment
+	// CapabilitiesPath 是 CapabilitiesURL 的兼容性别名。
+	CapabilitiesPath = CapabilitiesURL
+	// JobsPath 是 JobsURL 的兼容性别名。
+	JobsPath = JobsURL
+	// CapabilitiesURLTemplate 是能力发现 URL 模板的兼容性别名。
+	CapabilitiesURLTemplate = CapabilitiesURL
+	// JobsURLTemplate 是任务查询 URL 模板。
+	JobsURLTemplate = JobsURL + "/{job_id}"
+	// ReconcileURLTemplate 是 reconcile URL 模板。
+	ReconcileURLTemplate = V2APIPath + "/" + CertificatesPathSegment + "/{domain}/" + ReconcilePathSegment
+	// StatusURLTemplate 是状态 URL 模板。
+	StatusURLTemplate = V2APIPath + "/" + CertificatesPathSegment + "/{domain}/" + StatusPathSegment
+	// ManifestURLTemplate 是 manifest URL 模板。
+	ManifestURLTemplate = V2APIPath + "/" + CertificatesPathSegment + "/{domain}/" + GenerationsPathSegment + "/{generation}/" + ManifestPathSegment
+	// FilesURLTemplate 是文件 URL 模板。
+	FilesURLTemplate = V2APIPath + "/" + CertificatesPathSegment + "/{domain}/" + GenerationsPathSegment + "/{generation}/" + FilesPathSegment + "/{file_name}"
+	// DeploymentsURLTemplate 是部署回报 URL 模板。
+	DeploymentsURLTemplate = V2APIPath + "/" + CertificatesPathSegment + "/{domain}/" + DeploymentsPathSegment
 )
 
 // v2PathSegments 是 V2APIPath 拆分后的单段序列，避免把含分隔符的前缀当作单段校验。
@@ -53,32 +88,50 @@ func BuildURLPath(segments ...string) (string, error) {
 	return "/" + strings.Join(escaped, "/"), nil
 }
 
+// CapabilitiesURLPath 返回能力发现端点路径。
+func CapabilitiesURLPath() string { return CapabilitiesURL }
+
+// JobsURLPath 返回任务资源集合路径。
+func JobsURLPath() string { return JobsURL }
+
 // v2 路由以 domain 为授权主键，generation 作为其下的不可变版本子资源。
 
 // ReconcileURLPath 构造指定域名 reconcile 的 v2 URL 路径。
 func ReconcileURLPath(domain string) (string, error) {
+	if err := ValidateDomain(domain); err != nil {
+		return "", err
+	}
 	return BuildURLPath(
 		v2PathSegments[0],
 		v2PathSegments[1],
 		CertificatesPathSegment,
 		domain,
-		"reconcile",
+		ReconcilePathSegment,
 	)
 }
 
 // CertificateStatusURLPath 构造指定域名证书状态的 v2 URL 路径。
 func CertificateStatusURLPath(domain string) (string, error) {
+	if err := ValidateDomain(domain); err != nil {
+		return "", err
+	}
 	return BuildURLPath(
 		v2PathSegments[0],
 		v2PathSegments[1],
 		CertificatesPathSegment,
 		domain,
-		"status",
+		StatusPathSegment,
 	)
 }
 
+// StatusURLPath 是 CertificateStatusURLPath 的语义别名。
+func StatusURLPath(domain string) (string, error) { return CertificateStatusURLPath(domain) }
+
 // ManifestURLPath 构造指定域名与 generation 的 manifest v2 URL 路径。
 func ManifestURLPath(domain, generationID string) (string, error) {
+	if err := ValidateDomain(domain); err != nil {
+		return "", err
+	}
 	if err := ValidateGenerationID(generationID); err != nil {
 		return "", err
 	}
@@ -89,12 +142,15 @@ func ManifestURLPath(domain, generationID string) (string, error) {
 		domain,
 		GenerationsPathSegment,
 		generationID,
-		"manifest",
+		ManifestPathSegment,
 	)
 }
 
 // CertificateFileURLPath 构造指定域名与 generation 下固定证书文件的 v2 URL 路径。
 func CertificateFileURLPath(domain, generationID, fileName string) (string, error) {
+	if err := ValidateDomain(domain); err != nil {
+		return "", err
+	}
 	if err := ValidateGenerationID(generationID); err != nil {
 		return "", err
 	}
@@ -113,19 +169,30 @@ func CertificateFileURLPath(domain, generationID, fileName string) (string, erro
 	)
 }
 
+// FilesURLPath 是 CertificateFileURLPath 的语义别名。
+func FilesURLPath(domain, generationID, fileName string) (string, error) {
+	return CertificateFileURLPath(domain, generationID, fileName)
+}
+
 // DeploymentsURLPath 构造指定域名部署回报的 v2 URL 路径。
 func DeploymentsURLPath(domain string) (string, error) {
+	if err := ValidateDomain(domain); err != nil {
+		return "", err
+	}
 	return BuildURLPath(
 		v2PathSegments[0],
 		v2PathSegments[1],
 		CertificatesPathSegment,
 		domain,
-		"deployments",
+		DeploymentsPathSegment,
 	)
 }
 
 // JobURLPath 构造指定任务的 v2 URL 路径。
 func JobURLPath(jobID string) (string, error) {
+	if err := ValidateJobID(jobID); err != nil {
+		return "", err
+	}
 	return BuildURLPath(
 		v2PathSegments[0],
 		v2PathSegments[1],

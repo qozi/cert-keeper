@@ -125,6 +125,7 @@ func TestProtocolJSONRoundTrip(t *testing.T) {
 			Exists:     true,
 		},
 		Deployment: &DeploymentReport{
+			Domain:     "example.com",
 			Target:     "web-1",
 			State:      DeploymentStateSucceeded,
 			Success:    true,

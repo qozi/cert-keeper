@@ -14,6 +14,17 @@ import (
 // APIVersion 是公共协议的主版本标识。
 const APIVersion = "v2"
 
+const (
+	// MaxGenerationIDLength 是 generation 标识的最大字节数。
+	MaxGenerationIDLength = 128
+	// MaxJobIDLength 是任务 ID 的最大字节数。
+	MaxJobIDLength = 128
+	// MaxIdempotencyKeyLength 是幂等键的最大字节数。
+	MaxIdempotencyKeyLength = 128
+	// MaxDomainLength 是 DNS 域名的最大字节数。
+	MaxDomainLength = 253
+)
+
 // ErrorCode 是协议层结构化错误码。
 type ErrorCode string
 
@@ -24,6 +35,12 @@ const (
 	ErrorCodeInvalidGeneration ErrorCode = "invalid_generation"
 	// ErrorCodeInvalidRevision 表示 revision 不符合版本契约。
 	ErrorCodeInvalidRevision ErrorCode = "invalid_revision"
+	// ErrorCodeInvalidJobID 表示任务 ID 不符合单段标识契约。
+	ErrorCodeInvalidJobID ErrorCode = "invalid_job_id"
+	// ErrorCodeInvalidIdempotencyKey 表示幂等键缺失或格式不正确。
+	ErrorCodeInvalidIdempotencyKey ErrorCode = "invalid_idempotency_key"
+	// ErrorCodeInvalidDomain 表示域名不是规范化的小写 DNS 主机名。
+	ErrorCodeInvalidDomain ErrorCode = "invalid_domain"
 	// ErrorCodeInvalidPathSegment 表示 URL 路径段为空或含有控制字符。
 	ErrorCodeInvalidPathSegment ErrorCode = "invalid_path_segment"
 	// ErrorCodePathTraversal 表示路径段含有路径分隔符或路径穿越片段。
@@ -36,6 +53,16 @@ const (
 	ErrorCodeDuplicateFile ErrorCode = "duplicate_file"
 	// ErrorCodeInvalidManifest 表示文件 manifest 的元数据不正确。
 	ErrorCodeInvalidManifest ErrorCode = "invalid_manifest"
+	// ErrorCodeInvalidJobStatus 表示任务状态字段不一致或格式不正确。
+	ErrorCodeInvalidJobStatus ErrorCode = "invalid_job_status"
+	// ErrorCodeInvalidCapabilities 表示能力声明缺少必需字段或 URL。
+	ErrorCodeInvalidCapabilities ErrorCode = "invalid_capabilities"
+	// ErrorCodeInvalidDeploymentReport 表示部署回报字段缺失或不一致。
+	ErrorCodeInvalidDeploymentReport ErrorCode = "invalid_deployment_report"
+	// ErrorCodeUnauthorized 表示请求未通过身份认证。
+	ErrorCodeUnauthorized ErrorCode = "unauthorized"
+	// ErrorCodeForbidden 表示已认证但没有操作权限。
+	ErrorCodeForbidden ErrorCode = "forbidden"
 	// ErrorCodeNotFound 表示请求的证书或任务不存在。
 	ErrorCodeNotFound ErrorCode = "not_found"
 	// ErrorCodeConflict 表示请求与当前证书版本冲突。
@@ -106,6 +133,9 @@ func ValidateGenerationID(id string) error {
 	}
 	if err := validatePathSegment(id); err != nil {
 		return protocolError(ErrorCodeInvalidGeneration, "generation 必须是非空的单段标识")
+	}
+	if len(id) > MaxGenerationIDLength {
+		return protocolError(ErrorCodeInvalidGeneration, "generation 长度不能超过 128 字节")
 	}
 	for i := 0; i < len(id); i++ {
 		if !isUnreserved(id[i]) {
@@ -321,7 +351,14 @@ type JobStatus struct {
 	Revision Revision `json:"revision,omitempty"`
 	// Message 是补充状态说明。
 	Message string `json:"message,omitempty"`
+	// Retryable 表示当前失败是否允许调用方稍后重试。
+	Retryable bool `json:"retryable,omitempty"`
+	// ErrorCode 是失败任务的稳定错误码。
+	ErrorCode ErrorCode `json:"error_code,omitempty"`
+	// NextAttemptAt 是服务端计划下一次尝试的时间。
+	NextAttemptAt *time.Time `json:"next_attempt_at,omitempty"`
 	// Error 是任务失败时的结构化错误。
+	// Deprecated: 新调用方应优先读取 ErrorCode 和 Retryable。
 	Error *ErrorResponse `json:"error,omitempty"`
 	// CreatedAt 是任务创建时间。
 	CreatedAt time.Time `json:"created_at,omitempty"`
@@ -388,6 +425,8 @@ const (
 
 // DeploymentReport 是客户端部署证书后的结构化回报。
 type DeploymentReport struct {
+	// Domain 是本次部署产物所属的规范化域名，必须由调用方明确提供。
+	Domain string `json:"domain"`
 	// Target 是部署目标的稳定名称或标识。
 	Target string `json:"target,omitempty"`
 	// State 是部署生命周期状态。
@@ -459,6 +498,20 @@ type ReconcileResponse struct {
 	// Message 是补充结果说明。
 	Message string `json:"message,omitempty"`
 }
+
+// JobAcceptedResponse 是异步 reconcile 返回 HTTP 202 时的响应体。
+// Location 指向可持续查询的任务 URL，终态任务也可以通过该 URL 查询。
+type JobAcceptedResponse struct {
+	// Job 是新建或按幂等键复用的任务状态。
+	Job JobStatus `json:"job"`
+	// Location 是任务轮询 URL。
+	Location string `json:"location"`
+	// Reused 表示响应复用了已有任务。
+	Reused bool `json:"reused,omitempty"`
+}
+
+// AcceptedJobResponse 是 JobAcceptedResponse 的兼容性别名。
+type AcceptedJobResponse = JobAcceptedResponse
 
 func protocolError(code ErrorCode, message string) error {
 	return ErrorResponse{Code: code, Message: message}
