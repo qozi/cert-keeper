@@ -124,7 +124,7 @@ func TestRunOnceContinuesInOrderAndSkipsManualDNS(t *testing.T) {
 	if summary.Candidates != 3 || summary.Attempted != 2 || summary.Succeeded != 1 || summary.Failed != 1 || summary.Skipped != 1 {
 		t.Fatalf("汇总结果不正确: %+v", summary)
 	}
-	if len(summary.Results) != 3 || !summary.Results[1].Skipped || observed.Failed != 1 {
+	if len(summary.Results) != 3 || !summary.Results[1].Skipped || summary.Results[1].SkipReason == "" || observed.Failed != 1 {
 		t.Fatalf("observer 或结果记录不正确: summary=%+v observed=%+v", summary, observed)
 	}
 }

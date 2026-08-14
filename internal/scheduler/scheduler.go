@@ -76,10 +76,11 @@ type Config struct {
 
 // DomainResult 是一个候选域名在本轮的结果。
 type DomainResult struct {
-	Candidate Candidate
-	Result    Result
-	Skipped   bool
-	Error     error
+	Candidate  Candidate
+	Result     Result
+	Skipped    bool
+	SkipReason string
+	Error      error
 }
 
 // Summary 汇总一次运行中每个候选项的处理结果。
@@ -147,10 +148,12 @@ func (s *Scheduler) RunOnce(ctx context.Context) (summary Summary, err error) {
 	var failures []error
 	for _, candidate := range candidates {
 		if candidate.ChallengeMode == "dns_manual" {
+			reason := "dns_manual 不支持自动调度"
 			summary.Skipped++
 			summary.Results = append(summary.Results, DomainResult{
-				Candidate: candidate,
-				Skipped:   true,
+				Candidate:  candidate,
+				Skipped:    true,
+				SkipReason: reason,
 			})
 			continue
 		}
