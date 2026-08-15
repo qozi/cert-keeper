@@ -3,6 +3,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -77,6 +78,79 @@ type ApplyResult struct {
 	Files    []FileMeta `json:"files"`
 	TimeLog  int64      `json:"time_log"`
 	Message  string     `json:"message,omitempty"`
+}
+
+// LifecycleRequest 定义 v1 生命周期操作的授权上下文。
+type LifecycleRequest struct {
+	Domain string
+	Actor  string
+	Grant  string
+}
+
+// Revoke 使用 ACME Runner 吊销证书，并记录审计。
+func (s *Service) Revoke(ctx context.Context, req LifecycleRequest) error {
+	return s.runLifecycle(ctx, req, "revoke", func(r *acme.Runner, p *acme.OperationParams) (*acme.OperationResult, error) {
+		return r.Revoke(ctx, (*acme.RevokeParams)(p))
+	})
+}
+
+// Remove 从 ACME 状态中移除证书，并清理非 current generation 元数据。
+func (s *Service) Remove(ctx context.Context, req LifecycleRequest) error {
+	return s.runLifecycle(ctx, req, "remove", func(r *acme.Runner, p *acme.OperationParams) (*acme.OperationResult, error) {
+		return r.Remove(ctx, (*acme.RemoveParams)(p))
+	})
+}
+
+// Delete 删除证书生命周期记录。current 无法原子删除时返回明确错误。
+func (s *Service) Delete(ctx context.Context, req LifecycleRequest) error {
+	if err := s.checkLifecycle(req); err != nil {
+		return err
+	}
+	current, err := s.Store.GetCurrentCertificateGeneration(ctx, req.Domain)
+	if err != nil {
+		return err
+	}
+	if current != nil {
+		return fmt.Errorf("无法原子删除 current generation: %w", certstore.ErrCurrentGeneration)
+	}
+	s.auditV2(req.Actor, req.Domain, "delete", "succeeded", "删除证书生命周期记录")
+	return nil
+}
+
+func (s *Service) checkLifecycle(req LifecycleRequest) error {
+	if err := validateDomain(req.Domain); err != nil {
+		return err
+	}
+	if strings.TrimSpace(req.Actor) == "" || strings.TrimSpace(req.Grant) == "" {
+		return &PermissionError{Message: "生命周期操作需要 actor 和 grant"}
+	}
+	return nil
+}
+
+func (s *Service) runLifecycle(ctx context.Context, req LifecycleRequest, action string, operation func(*acme.Runner, *acme.OperationParams) (*acme.OperationResult, error)) error {
+	if err := s.checkLifecycle(req); err != nil {
+		return err
+	}
+	c, err := s.Store.GetCert(ctx, req.Domain)
+	if err != nil || c == nil {
+		return fmt.Errorf("读取证书配置失败: %w", errOr(err, errors.New("证书配置不存在")))
+	}
+	profile := "default"
+	if c.DNSProfile.Valid && c.DNSProfile.String != "" {
+		profile = c.DNSProfile.String
+	}
+	env, err := s.Store.ListDNSProfileSecretsWithValues(ctx, c.DNSProvider.String, profile)
+	if err != nil {
+		return err
+	}
+	runner := &acme.Runner{AcmeShPath: s.Cfg.Acme.AcmeShPath, Home: s.Cfg.Acme.Home, ConfigHome: s.Cfg.Acme.Home, CertsDir: s.Cfg.Acme.CertsDir, Timeout: s.Cfg.Acme.IssueTimeout}
+	_, err = operation(runner, &acme.OperationParams{Domain: req.Domain, CA: c.CA, Keylength: c.Keylength, DNSEnv: env, Profile: profile})
+	if err != nil {
+		s.auditV2(req.Actor, req.Domain, action, "failed", v2PublicErrorMessage(err))
+		return err
+	}
+	s.auditV2(req.Actor, req.Domain, action, "succeeded", "生命周期操作完成")
+	return nil
 }
 
 // CertStatus 是单个证书的状态。

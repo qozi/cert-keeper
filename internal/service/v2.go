@@ -6,7 +6,9 @@ package service
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -49,13 +51,156 @@ type V2ReconcileRequest struct {
 	Force          bool   `json:"force,omitempty"`
 }
 
+// ReconcileJob 执行一个已由持久 worker claim 的任务。actor 是内部主体，不经过 HTTP 授权。
+func (s *Service) ReconcileJob(ctx context.Context, actor scheduler.Actor, queued scheduler.Job) (scheduler.Result, error) {
+	job, err := s.Store.GetCertificateJob(ctx, queued.ID)
+	if err != nil || job == nil {
+		return scheduler.Result{}, fmt.Errorf("读取证书任务失败: %w", err)
+	}
+	owner := queued.LeaseOwner
+	if owner == "" {
+		return scheduler.Result{}, errors.New("任务缺少 lease owner")
+	}
+	return s.executeClaimedV2Job(ctx, actor, owner, job)
+}
+
+// ExecuteCertificateJob 领取并执行一个可恢复任务，供未使用 scheduler 适配器的 worker 调用。
+func (s *Service) ExecuteCertificateJob(ctx context.Context, owner string, actor scheduler.Actor) error {
+	job, err := s.Store.ClaimJob(ctx, owner, time.Minute)
+	if err != nil || job == nil {
+		return err
+	}
+	_, err = s.executeClaimedV2Job(ctx, actor, owner, job)
+	return err
+}
+
+func (s *Service) executeClaimedV2Job(ctx context.Context, actor scheduler.Actor, owner string, job *store.CertificateJob) (scheduler.Result, error) {
+	mu := s.v2DomainLock(job.Domain)
+	mu.Lock()
+	defer mu.Unlock()
+	// 领取后再次读取配置和 current，防止重启恢复时使用过期输入。
+	preset, err := s.Store.GetCert(ctx, job.Domain)
+	if err != nil || preset == nil {
+		return s.finishV2Failure(job, owner, actor, errOr(err, errors.New("证书配置不存在")))
+	}
+	cs, err := s.v2CertStore()
+	if err != nil {
+		return s.finishV2Failure(job, owner, actor, err)
+	}
+	state, err := s.readV2CurrentState(cs, job.Domain)
+	if err != nil {
+		return s.finishV2Failure(job, owner, actor, err)
+	}
+	force := strings.HasSuffix(job.Operation, ":force")
+	renewDays := preset.RenewDays
+	if renewDays <= 0 {
+		renewDays = s.Cfg.Acme.DefaultRenewDays
+	}
+	if !force && state.exists && !acme.ShouldRenew(state.notAfter, renewDays) {
+		_ = s.Store.UpdateJobStatus(context.Background(), job.ID, "succeeded", "")
+		s.auditV2("", job.Domain, "reconcile_v2", "succeeded", "证书未到期，跳过签发")
+		return scheduler.Result{}, nil
+	}
+	generation, err := s.Store.CreateCertificateGeneration(ctx, &store.CertificateGeneration{JobID: job.ID, Domain: job.Domain})
+	if err != nil {
+		return s.finishV2Failure(job, owner, actor, err)
+	}
+	profile := "default"
+	if preset.DNSProfile.Valid && preset.DNSProfile.String != "" {
+		profile = preset.DNSProfile.String
+	}
+	dnsEnv, err := s.Store.ListDNSProfileSecretsWithValues(ctx, preset.DNSProvider.String, profile)
+	if err != nil {
+		return s.finishV2GenerationFailure(job, generation, owner, actor, &v2SafeError{msg: "读取 DNS 凭据失败"})
+	}
+	stagingRoot, err := os.MkdirTemp("", "certkeeper-v2-*")
+	if err != nil {
+		return s.finishV2GenerationFailure(job, generation, owner, actor, err)
+	}
+	defer os.RemoveAll(stagingRoot)
+	stagingDir := filepath.Join(stagingRoot, job.Domain)
+	issuer := s.V2Issuer
+	if issuer == nil {
+		issuer = &acmeV2Issuer{cfg: s.Cfg}
+	}
+	err = issuer.Issue(ctx, V2IssueParams{Domain: job.Domain, SAN: splitCSV(preset.SAN), CA: v2OrDefault(preset.CA, s.Cfg.Acme.DefaultCA), Keylength: v2OrDefault(preset.Keylength, s.Cfg.Acme.DefaultKeylength), DNSProvider: preset.DNSProvider.String, DNSProfile: profile, DNSEnv: dnsEnv, StagingDir: stagingDir, Force: force})
+	if err != nil {
+		return s.finishV2GenerationFailure(job, generation, owner, actor, err)
+	}
+	published, _, err := cs.PublishWithSAN(job.Domain, stagingDir, splitCSV(preset.SAN))
+	if err != nil {
+		return s.finishV2GenerationFailure(job, generation, owner, actor, err)
+	}
+	manifest, err := cs.LoadGenerationManifest(job.Domain, published)
+	if err != nil {
+		return s.finishV2GenerationFailure(job, generation, owner, actor, err)
+	}
+	var notAfterUnix *int64
+	if fullchain, readErr := cs.ReadFile(job.Domain, published, certproto.FileFullchain); readErr == nil {
+		if t, parseErr := acme.ParsePemExpiry(fullchain); parseErr == nil {
+			v := t.Unix()
+			notAfterUnix = &v
+		}
+	}
+	if err = s.Store.UpdateCertificateGenerationStatus(ctx, generation.ID, "issued", string(published), string(published), "", nil, notAfterUnix); err != nil {
+		return s.finishV2GenerationFailure(job, generation, owner, actor, err)
+	}
+	_ = s.Store.UpdateCertificateGenerationArtifact(ctx, generation.ID, store.GenerationArtifact{Revision: int64(manifest.Revision), ManifestDigest: manifestDigest(manifest), Serial: manifest.Serial, Fingerprint: manifest.Fingerprint, Current: true})
+	if err = s.Store.UpdateJobStatus(context.Background(), job.ID, "succeeded", ""); err != nil {
+		return scheduler.Result{}, err
+	}
+	s.auditV2("", job.Domain, "reconcile_v2", "succeeded", "异步任务完成")
+	return scheduler.Result{}, nil
+}
+
+func (s *Service) finishV2Failure(job *store.CertificateJob, owner string, actor scheduler.Actor, cause error) (scheduler.Result, error) {
+	return s.finishV2GenerationFailure(job, nil, owner, actor, cause)
+}
+
+func (s *Service) finishV2GenerationFailure(job *store.CertificateJob, generation *store.CertificateGeneration, owner string, actor scheduler.Actor, cause error) (scheduler.Result, error) {
+	public := v2PublicErrorMessage(cause)
+	background := context.Background()
+	if generation != nil {
+		_ = s.Store.UpdateCertificateGenerationStatus(background, generation.ID, "failed", "", "", public, nil, nil)
+	}
+	code := "permanent"
+	if v2Retryable(cause) {
+		code = "retryable"
+	}
+	if code == "retryable" {
+		_ = s.Store.Retry(background, job.ID, owner, code, public, time.Minute)
+	} else {
+		_ = s.Store.UpdateJobStatus(background, job.ID, "failed", public)
+	}
+	s.auditV2("", job.Domain, "reconcile_v2", "failed", public)
+	return scheduler.Result{}, errors.New(public)
+}
+
+func v2Retryable(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || strings.Contains(strings.ToLower(err.Error()), "超时")
+}
+
+func errOr(err, fallback error) error {
+	if err != nil {
+		return err
+	}
+	return fallback
+}
+
+func manifestDigest(manifest certstore.GenerationManifest) string {
+	b, _ := json.Marshal(manifest)
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
 // v2CurrentState 是 certstore current generation 的快照。
 type v2CurrentState struct {
-	generation certproto.GenerationID
-	manifest   certproto.CertificateManifest
-	notAfter   time.Time
-	timeLog    int64
-	exists     bool
+	generation       certproto.GenerationID
+	manifest         certproto.CertificateManifest
+	manifestRevision certproto.Revision
+	notAfter         time.Time
+	timeLog          int64
+	exists           bool
 }
 
 // v2CertStore 惰性初始化并返回 generation 证书仓储。
@@ -66,7 +211,7 @@ func (s *Service) v2CertStore() (*certstore.Store, error) {
 	return s.v2cs, s.v2csErr
 }
 
-// ReconcileV2 按预置证书配置执行 reconcile：未到期跳过，到期或 force 时签发并发布新 generation。
+// ReconcileV2 校验请求并创建持久任务。证书签发由 worker 执行。
 func (s *Service) ReconcileV2(ctx context.Context, req V2ReconcileRequest) (certproto.ReconcileResponse, error) {
 	if err := v2ValidateDomain(req.Domain); err != nil {
 		return certproto.ReconcileResponse{}, err
@@ -110,6 +255,9 @@ func (s *Service) ReconcileV2(ctx context.Context, req V2ReconcileRequest) (cert
 			return certproto.ReconcileResponse{}, err
 		}
 	}
+	if req.Force {
+		operation += ":force"
+	}
 
 	jobID, err := v2NewJobID()
 	if err != nil {
@@ -125,141 +273,19 @@ func (s *Service) ReconcileV2(ctx context.Context, req V2ReconcileRequest) (cert
 	if err != nil {
 		return certproto.ReconcileResponse{}, fmt.Errorf("创建证书任务失败: %w", err)
 	}
-	cs, err := s.v2CertStore()
-	if err != nil {
-		return certproto.ReconcileResponse{}, fmt.Errorf("打开证书仓储失败: %w", err)
-	}
-
 	auditDetail := operation
 	if req.Reason != "" {
 		auditDetail += ": " + req.Reason
 	}
 
-	if job.ID != jobID {
-		// 相同幂等键的活动任务已存在：直接复用并返回该任务状态，不重复执行。
-		state := s.readV2CurrentStateSafe(cs, req.Domain)
-		revision, _ := s.v2GenerationRevision(ctx, req.Domain, state.generation)
-		return certproto.ReconcileResponse{
-			Success:    true,
-			Domain:     req.Domain,
-			Generation: state.generation,
-			Revision:   revision,
-			Changed:    false,
-			Job:        v2BuildJobStatus(job, state.generation, revision),
-			Status:     v2BuildCertificateStatus(req.Domain, state, time.Now()),
-			Message:    "相同幂等键的活动任务已在执行",
-		}, nil
+	state := &v2CurrentState{}
+	if cs, openErr := s.v2CertStore(); openErr == nil {
+		state = s.readV2CurrentStateSafe(cs, req.Domain)
 	}
-
-	// 每域名互斥锁，避免同域名并发签发。
-	mu := s.v2DomainLock(req.Domain)
-	mu.Lock()
-	defer mu.Unlock()
-
-	// 拿锁后必须重新读取 current generation 与证书有效期，再决定 skip 或执行。
-	state, err := s.readV2CurrentState(cs, req.Domain)
-	if err != nil {
-		return certproto.ReconcileResponse{}, s.failV2Job(ctx, job.ID, 0, req.TokenID, req.Domain, auditDetail, err)
-	}
-	renewDays := preset.RenewDays
-	if renewDays <= 0 {
-		renewDays = s.Cfg.Acme.DefaultRenewDays
-	}
-	if !req.Force && state.exists && !acme.ShouldRenew(state.notAfter, renewDays) {
-		if err := s.Store.UpdateJobStatus(ctx, job.ID, "succeeded", ""); err != nil {
-			return certproto.ReconcileResponse{}, fmt.Errorf("更新任务状态失败: %w", err)
-		}
-		s.auditV2(req.TokenID, req.Domain, "reconcile_v2", "succeeded", auditDetail+": 证书未到期，跳过签发")
-		revision, _ := s.v2GenerationRevision(ctx, req.Domain, state.generation)
-		return certproto.ReconcileResponse{
-			Success:    true,
-			Domain:     req.Domain,
-			Generation: state.generation,
-			Revision:   revision,
-			Changed:    false,
-			Job:        s.v2FinalJobStatus(ctx, job, state.generation, revision),
-			Status:     v2BuildCertificateStatus(req.Domain, state, time.Now()),
-			Message:    "证书未到期，跳过签发",
-		}, nil
-	}
-
-	if err := s.Store.UpdateJobStatus(ctx, job.ID, "running", ""); err != nil {
-		return certproto.ReconcileResponse{}, fmt.Errorf("更新任务状态失败: %w", err)
-	}
-	generation, err := s.Store.CreateCertificateGeneration(ctx, &store.CertificateGeneration{JobID: job.ID, Domain: req.Domain})
-	if err != nil {
-		return certproto.ReconcileResponse{}, s.failV2Job(ctx, job.ID, 0, req.TokenID, req.Domain, auditDetail, err)
-	}
-
-	dnsEnv, err := s.Store.ListSecretsByProvider(ctx, preset.DNSProvider.String, s.Cfg.Storage.EncryptionKey)
-	if err != nil {
-		return certproto.ReconcileResponse{}, s.failV2Job(ctx, job.ID, generation.ID, req.TokenID, req.Domain, auditDetail, &v2SafeError{msg: "读取 DNS 凭据失败"})
-	}
-
-	// staging 只放在系统临时目录，函数返回前整体清理。
-	stagingRoot, err := os.MkdirTemp("", "certkeeper-v2-*")
-	if err != nil {
-		return certproto.ReconcileResponse{}, s.failV2Job(ctx, job.ID, generation.ID, req.TokenID, req.Domain, auditDetail, err)
-	}
-	stagingDir := filepath.Join(stagingRoot, req.Domain)
-	defer func() { _ = os.RemoveAll(stagingRoot) }()
-
-	issuer := s.V2Issuer
-	if issuer == nil {
-		issuer = &acmeV2Issuer{cfg: s.Cfg}
-	}
-	issueErr := issuer.Issue(ctx, V2IssueParams{
-		Domain:      req.Domain,
-		SAN:         splitCSV(preset.SAN),
-		CA:          v2OrDefault(preset.CA, s.Cfg.Acme.DefaultCA),
-		Keylength:   v2OrDefault(preset.Keylength, s.Cfg.Acme.DefaultKeylength),
-		DNSProvider: preset.DNSProvider.String,
-		DNSEnv:      dnsEnv,
-		StagingDir:  stagingDir,
-	})
-	if issueErr != nil {
-		return certproto.ReconcileResponse{}, s.failV2Job(ctx, job.ID, generation.ID, req.TokenID, req.Domain, auditDetail, issueErr)
-	}
-
-	// Publish 原子切换 current；失败时旧 current 不变。
-	published, manifest, err := cs.Publish(req.Domain, stagingDir)
-	if err != nil {
-		return certproto.ReconcileResponse{}, s.failV2Job(ctx, job.ID, generation.ID, req.TokenID, req.Domain, auditDetail, err)
-	}
-
-	var notAfterUnix *int64
-	if fullchain, readErr := os.ReadFile(filepath.Join(stagingDir, string(certproto.FileFullchain))); readErr == nil {
-		if notAfter, parseErr := acme.ParsePemExpiry(fullchain); parseErr == nil && !notAfter.IsZero() {
-			value := notAfter.Unix()
-			notAfterUnix = &value
-		}
-	}
-	if err := s.Store.UpdateCertificateGenerationStatus(ctx, generation.ID, "issued", string(published), string(published), "", nil, notAfterUnix); err != nil {
-		// current 已切换，只能尽力记录失败。
-		return certproto.ReconcileResponse{}, s.failV2Job(ctx, job.ID, generation.ID, req.TokenID, req.Domain, auditDetail, err)
-	}
-	if err := s.Store.UpdateJobStatus(ctx, job.ID, "succeeded", ""); err != nil {
-		return certproto.ReconcileResponse{}, fmt.Errorf("更新任务状态失败: %w", err)
-	}
-	s.auditV2(req.TokenID, req.Domain, "reconcile_v2", "succeeded", auditDetail)
-
-	newState, stateErr := s.readV2CurrentState(cs, req.Domain)
-	if stateErr != nil {
-		newState = &v2CurrentState{generation: published, manifest: manifest, exists: true}
-		if notAfterUnix != nil {
-			newState.notAfter = time.Unix(*notAfterUnix, 0)
-		}
-	}
-	revision := certproto.Revision(generation.Generation)
-	return certproto.ReconcileResponse{
-		Success:    true,
-		Domain:     req.Domain,
-		Generation: published,
-		Revision:   revision,
-		Changed:    true,
-		Job:        s.v2FinalJobStatus(ctx, job, published, revision),
-		Status:     v2BuildCertificateStatus(req.Domain, newState, time.Now()),
-	}, nil
+	revision, _ := s.v2GenerationRevision(ctx, req.Domain, state.generation)
+	return certproto.ReconcileResponse{Success: true, Domain: req.Domain, Generation: state.generation,
+		Revision: revision, Changed: false, Job: v2BuildJobStatus(job, state.generation, revision),
+		Status: v2BuildCertificateStatus(req.Domain, state, time.Now()), Message: "任务已排队，等待 worker 执行"}, nil
 }
 
 // StatusV2 基于 certstore current generation 返回证书状态，需要 status 授权。
@@ -358,20 +384,31 @@ func (s *Service) ReportDeploymentV2(ctx context.Context, tokenID, domain string
 	if err := s.requireV2Permission(ctx, tokenID, domain, "apply"); err != nil {
 		return err
 	}
-	// 按域名最新的 generation 记录关联部署报告。
 	generations, err := s.Store.ListCertificateGenerations(ctx, domain)
 	if err != nil {
 		return fmt.Errorf("读取证书代次失败: %w", err)
 	}
-	if len(generations) == 0 {
-		return &ValidationError{Message: "该域名没有可关联的证书代次"}
+	if report.Generation == "" || report.Revision < 1 {
+		return &ValidationError{Message: "部署回报必须提供 generation 和 revision"}
+	}
+	var matched *store.CertificateGeneration
+	for i := range generations {
+		if generations[i].CertificateRef.Valid && generations[i].CertificateRef.String == string(report.Generation) && generations[i].Revision == int64(report.Revision) {
+			matched = &generations[i]
+			break
+		}
+	}
+	if matched == nil {
+		return &ValidationError{Message: "部署回报 generation/revision 不匹配"}
 	}
 	detail := fmt.Sprintf("state=%s verified=%t reloaded=%t", report.State, report.Verified, report.Reloaded)
 	if report.Message != "" {
 		detail += " " + v2SanitizeDetail(report.Message, 256)
 	}
 	if _, err := s.Store.CreateDeploymentReport(ctx, &store.DeploymentReport{
-		GenerationID: generations[0].ID,
+		GenerationID: matched.ID,
+		Generation:   string(report.Generation),
+		Revision:     int64(report.Revision),
 		Target:       report.Target,
 		Status:       status,
 		Detail:       nullable(detail),
@@ -482,6 +519,9 @@ func (s *Service) readV2CurrentState(cs *certstore.Store, domain string) (*v2Cur
 	}
 	state.generation = generation
 	state.manifest = manifest
+	if fullManifest, manifestErr := cs.LoadGenerationManifest(domain, generation); manifestErr == nil {
+		state.manifestRevision = fullManifest.Revision
+	}
 	state.notAfter = notAfter
 	state.exists = true
 	if data, err := cs.ReadFile(domain, generation, certproto.FileTimeLog); err == nil {
@@ -512,6 +552,7 @@ func v2BuildCertificateStatus(domain string, state *v2CurrentState, now time.Tim
 	status.Exists = true
 	status.Generation = state.generation
 	status.Files = state.manifest
+	status.Revision = state.manifestRevision
 	status.NotAfter = state.notAfter
 	status.TimeLog = state.timeLog
 	if now.Before(state.notAfter) {
@@ -564,7 +605,7 @@ func (s *Service) v2GenerationRevision(ctx context.Context, domain string, gener
 	}
 	for i := range records {
 		if records[i].CertificateRef.Valid && records[i].CertificateRef.String == string(generation) {
-			return certproto.Revision(records[i].Generation), &records[i]
+			return certproto.Revision(records[i].Revision), &records[i]
 		}
 	}
 	return 0, nil
@@ -578,7 +619,7 @@ func (s *Service) v2JobGeneration(ctx context.Context, job *store.CertificateJob
 	}
 	for i := range records {
 		if records[i].JobID == job.ID {
-			revision := certproto.Revision(records[i].Generation)
+			revision := certproto.Revision(records[i].Revision)
 			if records[i].CertificateRef.Valid {
 				return certproto.GenerationID(records[i].CertificateRef.String), revision
 			}

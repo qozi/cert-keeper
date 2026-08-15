@@ -4,7 +4,6 @@ package service
 import (
 	"context"
 	"errors"
-	"path/filepath"
 
 	"github.com/siidoo/certkeeper/internal/acme"
 	"github.com/siidoo/certkeeper/internal/config"
@@ -18,6 +17,8 @@ type V2IssueParams struct {
 	CA          string
 	Keylength   string
 	DNSProvider string
+	DNSProfile  string
+	Force       bool
 	// DNSEnv 是已解密的 DNS 环境变量，签发器不得将其写入日志或错误。
 	DNSEnv map[string]string
 	// StagingDir 是签发产物目录。签发器负责创建该目录，并写入
@@ -40,10 +41,11 @@ func (i *acmeV2Issuer) Issue(ctx context.Context, params V2IssueParams) error {
 	runner := &acme.Runner{
 		AcmeShPath: i.cfg.Acme.AcmeShPath,
 		Home:       i.cfg.Acme.Home,
+		ConfigHome: i.cfg.Acme.Home,
 		CertsDir:   i.cfg.Acme.CertsDir,
 		Timeout:    i.cfg.Acme.IssueTimeout,
 	}
-	res, err := runner.Issue(ctx, &acme.IssueParams{
+	res, err := runner.IssueOrRenew(ctx, &acme.IssueParams{
 		Domain:        params.Domain,
 		SAN:           params.SAN,
 		CA:            params.CA,
@@ -51,9 +53,9 @@ func (i *acmeV2Issuer) Issue(ctx context.Context, params V2IssueParams) error {
 		DNSProvider:   params.DNSProvider,
 		Keylength:     params.Keylength,
 		DNSEnv:        params.DNSEnv,
-		// Runner 将产物写入 CertsDir/<domain>/，即约定的 StagingDir。
-		CertsDir: filepath.Dir(params.StagingDir),
-	})
+		Profile:       params.DNSProfile,
+		StagingDir:    params.StagingDir,
+	}, params.Force)
 	if err != nil {
 		// 刻意忽略 res.StdoutStderr，避免把 ACME 原始输出传回调用方。
 		return err

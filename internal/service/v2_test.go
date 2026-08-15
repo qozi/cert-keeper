@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/siidoo/certkeeper/internal/certstore"
+	"github.com/siidoo/certkeeper/internal/scheduler"
 	"github.com/siidoo/certkeeper/internal/store"
 	"github.com/siidoo/certkeeper/pkg/certproto"
 )
@@ -231,7 +232,7 @@ func TestReconcileV2ForceAuth(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !resp.Success || !resp.Changed {
+		if !resp.Success || resp.Changed || resp.Job.State != certproto.JobStateQueued {
 			t.Fatalf("force reconcile 结果异常: %+v", resp)
 		}
 	})
@@ -253,9 +254,24 @@ func TestReconcileV2IssuesPublishesAndAudits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !resp.Success || !resp.Changed || resp.Generation == "" || resp.Revision != 1 {
+	if !resp.Success || resp.Changed || resp.Job.State != certproto.JobStateQueued {
 		t.Fatalf("reconcile 结果异常: %+v", resp)
 	}
+	if err := svc.ExecuteCertificateJob(ctx, "service-test-worker", scheduler.Actor{ID: "worker", Kind: "system"}); err != nil {
+		t.Fatal(err)
+	}
+	job, _ := svc.Store.GetCertificateJob(ctx, resp.Job.ID)
+	resp.Job = v2BuildJobStatus(job, "", 0)
+	resp.Generation, resp.Revision = svc.v2JobGeneration(ctx, job)
+	cs, err := certstore.Open(cfg.Acme.CertsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := svc.readV2CurrentState(cs, "example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Status = v2BuildCertificateStatus("example.com", state, time.Now())
 	if resp.Job.State != certproto.JobStateSucceeded {
 		t.Fatalf("任务状态 = %q，期望 succeeded", resp.Job.State)
 	}
@@ -267,7 +283,7 @@ func TestReconcileV2IssuesPublishesAndAudits(t *testing.T) {
 	}
 
 	// certstore current 必须指向新发布的 generation。
-	cs, err := certstore.Open(cfg.Acme.CertsDir)
+	cs, err = certstore.Open(cfg.Acme.CertsDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -287,7 +303,7 @@ func TestReconcileV2IssuesPublishesAndAudits(t *testing.T) {
 	if generations[0].Status != "issued" || generations[0].CertificateRef.String != string(resp.Generation) {
 		t.Fatalf("代次记录内容异常: %+v", generations[0])
 	}
-	job, err := svc.Store.GetCertificateJob(ctx, resp.Job.ID)
+	job, err = svc.Store.GetCertificateJob(ctx, resp.Job.ID)
 	if err != nil || job == nil || job.Status != "succeeded" {
 		t.Fatalf("任务记录异常: %+v err=%v", job, err)
 	}
@@ -308,15 +324,33 @@ func TestReconcileV2SkipsWhenFresh(t *testing.T) {
 	svc.V2Issuer = issuer
 
 	first, err := svc.ReconcileV2(ctx, V2ReconcileRequest{TokenID: "client-a", Domain: "example.com", IdempotencyKey: "k1"})
-	if err != nil || !first.Changed {
+	if err != nil || first.Changed || first.Job.State != certproto.JobStateQueued {
 		t.Fatalf("首次 reconcile 异常: %+v err=%v", first, err)
 	}
+	if err := svc.ExecuteCertificateJob(ctx, "service-test-worker", scheduler.Actor{ID: "worker", Kind: "system"}); err != nil {
+		t.Fatal(err)
+	}
+	job, err := svc.Store.GetCertificateJob(ctx, first.Job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Generation, first.Revision = svc.v2JobGeneration(ctx, job)
 	second, err := svc.ReconcileV2(ctx, V2ReconcileRequest{TokenID: "client-a", Domain: "example.com", IdempotencyKey: "k2"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if second.Changed || second.Generation != first.Generation {
 		t.Fatalf("未到期应跳过且 generation 不变: %+v", second)
+	}
+	if second.Job.State != certproto.JobStateSucceeded {
+		if err := svc.ExecuteCertificateJob(ctx, "service-test-worker", scheduler.Actor{ID: "worker", Kind: "system"}); err != nil {
+			t.Fatal(err)
+		}
+		secondJob, getErr := svc.Store.GetCertificateJob(ctx, second.Job.ID)
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+		second.Job = v2BuildJobStatus(secondJob, second.Generation, second.Revision)
 	}
 	if second.Job.State != certproto.JobStateSucceeded {
 		t.Fatalf("跳过的任务状态 = %q，期望 succeeded", second.Job.State)
@@ -334,28 +368,13 @@ func TestReconcileV2IdempotentReuse(t *testing.T) {
 	createV2Token(t, svc, "client-a", false)
 	grantV2(t, svc, "client-a", "example.com", "apply")
 
-	gate := make(chan struct{})
-	entered := make(chan struct{})
-	var once sync.Once
-	issuer := &fakeV2Issuer{fn: func(params V2IssueParams) error {
-		once.Do(func() { close(entered) })
-		<-gate
-		return v2WriteTestStaging(params.StagingDir, params.Domain, time.Now().Add(90*24*time.Hour))
-	}}
+	issuer := &fakeV2Issuer{}
 	svc.V2Issuer = issuer
-
-	type outcome struct {
-		resp certproto.ReconcileResponse
-		err  error
+	first, err := svc.ReconcileV2(ctx, V2ReconcileRequest{TokenID: "client-a", Domain: "example.com", IdempotencyKey: "same-key"})
+	if err != nil {
+		t.Fatal(err)
 	}
-	firstCh := make(chan outcome, 1)
-	go func() {
-		resp, err := svc.ReconcileV2(ctx, V2ReconcileRequest{TokenID: "client-a", Domain: "example.com", IdempotencyKey: "same-key"})
-		firstCh <- outcome{resp, err}
-	}()
-	<-entered
-
-	// 相同幂等键的第二个请求直接复用活动任务，不等待锁也不重复执行。
+	// 相同幂等键复用 queued 任务，不重复签发。
 	second, err := svc.ReconcileV2(ctx, V2ReconcileRequest{TokenID: "client-a", Domain: "example.com", IdempotencyKey: "same-key"})
 	if err != nil {
 		t.Fatal(err)
@@ -363,13 +382,11 @@ func TestReconcileV2IdempotentReuse(t *testing.T) {
 	if second.Changed || second.Job.ID == "" {
 		t.Fatalf("幂等复用结果异常: %+v", second)
 	}
-	close(gate)
-	first := <-firstCh
-	if first.err != nil {
-		t.Fatal(first.err)
+	if second.Job.ID != first.Job.ID {
+		t.Fatalf("幂等复用任务 ID = %q，期望 %q", second.Job.ID, first.Job.ID)
 	}
-	if second.Job.ID != first.resp.Job.ID {
-		t.Fatalf("幂等复用任务 ID = %q，期望 %q", second.Job.ID, first.resp.Job.ID)
+	if err := svc.ExecuteCertificateJob(ctx, "service-test-worker", scheduler.Actor{ID: "worker", Kind: "system"}); err != nil {
+		t.Fatal(err)
 	}
 	if issuer.calls.Load() != 1 {
 		t.Fatalf("签发器调用次数 = %d，期望 1", issuer.calls.Load())
@@ -405,18 +422,20 @@ func TestReconcileV2ConcurrentIssuesOnce(t *testing.T) {
 			t.Fatalf("并发 reconcile %d 失败: %v", i, err)
 		}
 	}
-	// 锁内二次检查保证只签发一次：恰好一个 Changed=true。
+	if err := svc.ExecuteCertificateJob(ctx, "service-test-worker", scheduler.Actor{ID: "worker", Kind: "system"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.ExecuteCertificateJob(ctx, "service-test-worker", scheduler.Actor{ID: "worker", Kind: "system"}); err != nil {
+		t.Fatal(err)
+	}
+	// 锁内二次检查保证两个 queued job 只签发一次。
 	if issuer.calls.Load() != 1 {
 		t.Fatalf("签发器调用次数 = %d，期望 1", issuer.calls.Load())
 	}
-	changed := 0
 	for _, resp := range results {
-		if resp.Changed {
-			changed++
+		if resp.Job.State != certproto.JobStateQueued {
+			t.Fatalf("任务未入队: %+v", resp)
 		}
-	}
-	if changed != 1 {
-		t.Fatalf("Changed=true 的次数 = %d，期望 1: %+v", changed, results)
 	}
 }
 
@@ -432,8 +451,11 @@ func TestReconcileV2FailureKeepsCurrent(t *testing.T) {
 	svc.V2Issuer = issuer
 
 	first, err := svc.ReconcileV2(ctx, V2ReconcileRequest{TokenID: "admin-a", IsAdmin: true, Domain: "example.com", IdempotencyKey: "k1"})
-	if err != nil || !first.Changed {
+	if err != nil || first.Job.State != certproto.JobStateQueued {
 		t.Fatalf("首次 reconcile 异常: %+v err=%v", first, err)
+	}
+	if err := svc.ExecuteCertificateJob(ctx, "service-test-worker", scheduler.Actor{ID: "worker", Kind: "system"}); err != nil {
+		t.Fatal(err)
 	}
 	cs, err := certstore.Open(cfg.Acme.CertsDir)
 	if err != nil {
@@ -453,6 +475,7 @@ func TestReconcileV2FailureKeepsCurrent(t *testing.T) {
 	_, err = svc.ReconcileV2(ctx, V2ReconcileRequest{
 		TokenID: "admin-a", IsAdmin: true, Domain: "example.com", IdempotencyKey: "k2", Force: true,
 	})
+	err = svc.ExecuteCertificateJob(ctx, "service-test-worker", scheduler.Actor{ID: "worker", Kind: "system"})
 	if err == nil {
 		t.Fatal("签发失败应返回错误")
 	}
@@ -541,6 +564,14 @@ func TestStatusV2AndManifestV2(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := svc.ExecuteCertificateJob(ctx, "service-test-worker", scheduler.Actor{ID: "worker", Kind: "system"}); err != nil {
+		t.Fatal(err)
+	}
+	jobRecord, err := svc.Store.GetCertificateJob(ctx, resp.Job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Generation, resp.Revision = svc.v2JobGeneration(ctx, jobRecord)
 	status, err = svc.StatusV2(ctx, "client-a", "example.com")
 	if err != nil {
 		t.Fatal(err)
@@ -578,6 +609,9 @@ func TestReadGenerationFileV2Permissions(t *testing.T) {
 	svc.V2Issuer = &fakeV2Issuer{}
 
 	if _, err := svc.ReconcileV2(ctx, V2ReconcileRequest{TokenID: "client-a", Domain: "example.com", IdempotencyKey: "k1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.ExecuteCertificateJob(ctx, "service-test-worker", scheduler.Actor{ID: "worker", Kind: "system"}); err != nil {
 		t.Fatal(err)
 	}
 	cs, err := certstore.Open(cfg.Acme.CertsDir)
@@ -655,9 +689,17 @@ func TestReportDeploymentV2(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := svc.ExecuteCertificateJob(ctx, "service-test-worker", scheduler.Actor{ID: "worker", Kind: "system"}); err != nil {
+		t.Fatal(err)
+	}
+	jobRecord, err := svc.Store.GetCertificateJob(ctx, resp.Job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Generation, resp.Revision = svc.v2JobGeneration(ctx, jobRecord)
 	if err := svc.ReportDeploymentV2(ctx, "client-a", "example.com", certproto.DeploymentReport{
 		Target: "edge-1", State: certproto.DeploymentStateSucceeded, Success: true,
-		Generation: resp.Generation, Verified: true, Reloaded: true, Message: "部署完成",
+		Generation: resp.Generation, Revision: resp.Revision, Verified: true, Reloaded: true, Message: "部署完成",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -709,11 +751,14 @@ func TestGetJobV2(t *testing.T) {
 		t.Fatal("无 status 授权应被拒绝")
 	}
 	grantV2(t, svc, "client-a", "example.com", "status")
+	if err := svc.ExecuteCertificateJob(ctx, "service-test-worker", scheduler.Actor{ID: "worker", Kind: "system"}); err != nil {
+		t.Fatal(err)
+	}
 	job, err := svc.GetJobV2(ctx, "client-a", resp.Job.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if job.State != certproto.JobStateSucceeded || job.Generation != resp.Generation {
+	if job.State != certproto.JobStateSucceeded || job.Generation == "" || job.Revision < 1 {
 		t.Fatalf("任务状态异常: %+v", job)
 	}
 
