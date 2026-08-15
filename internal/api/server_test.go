@@ -20,6 +20,7 @@ func (testLogger) Error(string, ...any) {}
 func TestCertStatusRequiresAuthentication(t *testing.T) {
 	root := t.TempDir()
 	cfg := config.Default()
+	cfg.Auth.LegacyAPIEnabled = true
 	cfg.Storage.SQLitePath = filepath.Join(root, "db", "certkeeper.db")
 	st, err := store.Open(cfg.Storage.SQLitePath)
 	if err != nil {

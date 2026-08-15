@@ -29,6 +29,7 @@ var testNow = time.Unix(2_000_000_000, 0)
 func newAuthTestServer(t *testing.T) (*Server, http.Handler) {
 	t.Helper()
 	cfg := config.Default()
+	cfg.Auth.LegacyAPIEnabled = true
 	cfg.Storage.SQLitePath = filepath.Join(t.TempDir(), "db", "certkeeper.db")
 	st, err := store.Open(cfg.Storage.SQLitePath)
 	if err != nil {

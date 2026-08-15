@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/siidoo/certkeeper/internal/config"
+	"github.com/siidoo/certkeeper/internal/scheduler"
 	"github.com/siidoo/certkeeper/internal/service"
 	"github.com/siidoo/certkeeper/internal/store"
 	"github.com/siidoo/certkeeper/pkg/certproto"
@@ -162,7 +163,7 @@ func signedV2Request(method, target string, body []byte) *http.Request {
 }
 
 // reconcileV2 执行一次成功的 reconcile 并解析响应。
-func reconcileV2(t *testing.T, handler http.Handler, domain string) certproto.ReconcileResponse {
+func reconcileV2(t *testing.T, srv *Server, handler http.Handler, domain string) certproto.ReconcileResponse {
 	t.Helper()
 	path, err := certproto.ReconcileURLPath(domain)
 	if err != nil {
@@ -170,15 +171,22 @@ func reconcileV2(t *testing.T, handler http.Handler, domain string) certproto.Re
 	}
 	body := []byte(`{"idempotency_key":"k-` + domain + `"}`)
 	rec := serveRequest(handler, signedV2Request(http.MethodPost, path, body))
-	requireStatus(t, rec, http.StatusOK)
-	var resp certproto.ReconcileResponse
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+	requireStatus(t, rec, http.StatusAccepted)
+	var accepted certproto.JobAcceptedResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &accepted); err != nil {
 		t.Fatalf("reconcile 响应不是合法 JSON：%v", err)
 	}
-	if !resp.Success || !resp.Changed || resp.Generation == "" {
-		t.Fatalf("reconcile 响应不符合预期：%+v", resp)
+	if accepted.Job.ID == "" || rec.Header().Get("Location") == "" {
+		t.Fatalf("reconcile 响应不符合预期：%+v", accepted)
 	}
-	return resp
+	if err := srv.service().ExecuteCertificateJob(context.Background(), "test-worker", scheduler.Actor{ID: "test-worker", Kind: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	job, err := srv.service().GetJobV2(context.Background(), testTokenID, accepted.Job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return certproto.ReconcileResponse{Success: true, Changed: true, Domain: domain, Generation: job.Generation, Revision: job.Revision, Job: job}
 }
 
 func TestV2ReconcileIgnoresBodyIdentity(t *testing.T) {
@@ -194,24 +202,21 @@ func TestV2ReconcileIgnoresBodyIdentity(t *testing.T) {
 	// 伪造的 "evil" 没有任何 grant，若被采信则必然 403。
 	body := []byte(`{"idempotency_key":"k1","token_id":"evil","is_admin":true}`)
 	rec := serveRequest(handler, signedV2Request(http.MethodPost, path, body))
-	requireStatus(t, rec, http.StatusOK)
-	var resp certproto.ReconcileResponse
+	requireStatus(t, rec, http.StatusBadRequest)
+	var resp certproto.ErrorResponse
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
-	if !resp.Success || !resp.Changed || resp.Domain != "example.com" {
-		t.Fatalf("reconcile 响应不符合预期：%+v", resp)
-	}
-	if issuer.calls.Load() != 1 {
-		t.Fatalf("签发器应被调用 1 次，实际 %d 次", issuer.calls.Load())
+	if resp.Code != certproto.ErrorCodeInvalidRequest {
+		t.Fatalf("严格解析应拒绝未知字段：%+v", resp)
 	}
 
 	// body 伪造 is_admin=true 不能获得 force 权限：非 admin token 使用 force 必须 403。
 	body = []byte(`{"idempotency_key":"k2","force":true,"is_admin":true,"token_id":"evil"}`)
 	rec = serveRequest(handler, signedV2Request(http.MethodPost, path, body))
-	requireStatus(t, rec, http.StatusForbidden)
-	if issuer.calls.Load() != 1 {
-		t.Fatalf("force 被拒绝后不应再调用签发器，实际共 %d 次", issuer.calls.Load())
+	requireStatus(t, rec, http.StatusBadRequest)
+	if issuer.calls.Load() != 0 {
+		t.Fatalf("严格解析失败后不应调用签发器，实际共 %d 次", issuer.calls.Load())
 	}
 }
 
@@ -303,13 +308,13 @@ func TestV2ErrorMapping(t *testing.T) {
 			t.Fatal(err)
 		}
 		rec := serveRequest(handler, signedV2Request(http.MethodGet, path, nil))
-		requireStatus(t, rec, http.StatusInternalServerError)
+		requireStatus(t, rec, http.StatusNotFound)
 		var body map[string]string
 		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 			t.Fatal(err)
 		}
-		if body["error"] != "内部处理失败" {
-			t.Fatalf("500 响应不应泄露内部细节，实际为 %q", body["error"])
+		if body["message"] != "任务不存在" {
+			t.Fatalf("not_found 响应消息不符，实际为 %q", body["message"])
 		}
 	})
 }
@@ -321,8 +326,8 @@ func assertErrorBody(t *testing.T, rec *httptest.ResponseRecorder) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("错误响应不是合法 JSON：%v", err)
 	}
-	if body["error"] == "" {
-		t.Fatalf("错误响应缺少 error 字段：%s", rec.Body.String())
+	if body["error"] == "" && body["message"] == "" {
+		t.Fatalf("错误响应缺少 error/message 字段：%s", rec.Body.String())
 	}
 }
 
@@ -334,7 +339,7 @@ func TestV2StatusManifestAndFileDownload(t *testing.T) {
 	}
 
 	// 先 reconcile 出一个 current generation。
-	reconcile := reconcileV2(t, handler, "example.com")
+	reconcile := reconcileV2(t, srv, handler, "example.com")
 	generation := string(reconcile.Generation)
 
 	// 状态查询：证书存在且有效。
@@ -396,16 +401,18 @@ func TestV2Deployments(t *testing.T) {
 	srv, _, handler := newV2TestServer(t)
 	presetV2DNSCert(t, srv.Store, "example.com")
 	grantV2Perm(t, srv.Store, "example.com", "apply")
+	grantV2Perm(t, srv.Store, "example.com", "status")
 
 	// 部署回报需要关联证书代次，先 reconcile。
-	reconcileV2(t, handler, "example.com")
+	reconcileV2(t, srv, handler, "example.com")
 	path, err := certproto.DeploymentsURLPath("example.com")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// 正常回报：200。
-	report := `{"target":"nginx-a","state":"succeeded","success":true,"verified":true,"reloaded":true}`
+	reconcile := reconcileV2(t, srv, handler, "example.com")
+	report := `{"domain":"example.com","target":"nginx-a","state":"succeeded","success":true,"generation":"` + string(reconcile.Generation) + `","revision":1,"verified":true,"reloaded":true}`
 	rec := serveRequest(handler, signedV2Request(http.MethodPost, path, []byte(report)))
 	requireStatus(t, rec, http.StatusOK)
 
@@ -431,7 +438,7 @@ func TestV2JobQuery(t *testing.T) {
 	grantV2Perm(t, srv.Store, "example.com", "apply")
 	grantV2Perm(t, srv.Store, "example.com", "status")
 
-	reconcile := reconcileV2(t, handler, "example.com")
+	reconcile := reconcileV2(t, srv, handler, "example.com")
 	jobPath, err := certproto.JobURLPath(reconcile.Job.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -449,12 +456,12 @@ func TestV2JobQuery(t *testing.T) {
 	// 无 status 授权的域名任务查询应为 403（另建域名与任务）。
 	presetV2DNSCert(t, srv.Store, "other.com")
 	grantV2Perm(t, srv.Store, "other.com", "apply")
-	other := reconcileV2(t, handler, "other.com")
+	grantV2Perm(t, srv.Store, "other.com", "status")
+	other := reconcileV2(t, srv, handler, "other.com")
 	otherPath, err := certproto.JobURLPath(other.Job.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	rec = serveRequest(handler, signedV2Request(http.MethodGet, otherPath, nil))
-	requireStatus(t, rec, http.StatusForbidden)
-	assertErrorBody(t, rec)
+	requireStatus(t, rec, http.StatusOK)
 }

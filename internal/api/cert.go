@@ -36,6 +36,20 @@ func (s *Server) applyCert(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "domain 必填"})
 		return
 	}
+	if err := s.requireLegacyGrant(r, req.Domain, "apply"); err != nil {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+		return
+	}
+	if req.Force {
+		if t == nil || !t.IsAdmin {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "force 仅管理员可用"})
+			return
+		}
+		if err := s.requireLegacyGrant(r, req.Domain, "force"); err != nil {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+			return
+		}
+	}
 	if req.ChallengeMode != "" && t != nil && !t.IsAdmin {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "推参申请（方式2）需要 admin token"})
 		return
@@ -95,6 +109,10 @@ func (s *Server) certSubtree(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) certStatus(w http.ResponseWriter, r *http.Request, domain string) {
+	if err := s.requireLegacyGrant(r, domain, "status"); err != nil {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+		return
+	}
 	status, err := s.service().Status(r.Context(), domain)
 	if err != nil {
 		var validationErr *service.ValidationError
@@ -109,6 +127,14 @@ func (s *Server) certStatus(w http.ResponseWriter, r *http.Request, domain strin
 }
 
 func (s *Server) certFile(w http.ResponseWriter, r *http.Request, domain, name string) {
+	permission := "read_cert"
+	if name == "key.pem" {
+		permission = "read_private_key"
+	}
+	if err := s.requireLegacyGrant(r, domain, permission); err != nil {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+		return
+	}
 	data, err := s.service().ReadFile(r.Context(), domain, name)
 	if err != nil {
 		var validationErr *service.ValidationError
@@ -123,6 +149,22 @@ func (s *Server) certFile(w http.ResponseWriter, r *http.Request, domain, name s
 		return
 	}
 	http.ServeContent(w, r, name, time.Time{}, bytes.NewReader(data))
+}
+
+// requireLegacyGrant 让旧接口也遵循 v2 的域名授权和私钥权限模型。
+func (s *Server) requireLegacyGrant(r *http.Request, domain, permission string) error {
+	t := tokenFromCtx(r)
+	if t == nil {
+		return errors.New("缺少认证主体")
+	}
+	ok, err := s.Store.HasCertificatePermission(r.Context(), t.ID, domain, permission)
+	if err != nil {
+		return errors.New("检查证书授权失败")
+	}
+	if !ok {
+		return errors.New("token 缺少 " + permission + " 权限")
+	}
+	return nil
 }
 
 func (s *Server) registerClient(w http.ResponseWriter, r *http.Request) {

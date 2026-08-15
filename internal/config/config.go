@@ -4,6 +4,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"time"
 
@@ -23,11 +24,15 @@ type Config struct {
 
 // ServerConfig 定义 HTTP 服务器的配置项。
 type ServerConfig struct {
-	Listen   string `yaml:"listen"`
-	TLS      bool   `yaml:"tls"`
-	CertFile string `yaml:"cert_file"`
-	KeyFile  string `yaml:"key_file"`
-	BaseURL  string `yaml:"base_url"`
+	Listen         string   `yaml:"listen"`
+	TLSMode        string   `yaml:"tls_mode"`
+	TLS            bool     `yaml:"tls"` // 兼容旧配置；TLSMode 为空时由 TLS 推导
+	CertFile       string   `yaml:"cert_file"`
+	KeyFile        string   `yaml:"key_file"`
+	TrustedProxies []string `yaml:"trusted_proxies"`
+	ClientCAFile   string   `yaml:"client_ca_file"`
+	ClientMTLS     bool     `yaml:"client_mtls"`
+	BaseURL        string   `yaml:"base_url"`
 	// 以下超时对应 http.Server 的同名字段，0 表示不限制。
 	ReadHeaderTimeout time.Duration `yaml:"read_header_timeout"`
 	ReadTimeout       time.Duration `yaml:"read_timeout"`
@@ -53,6 +58,7 @@ type AuthConfig struct {
 	TimestampWindowSec int    `yaml:"timestamp_window_sec"`
 	NonceTTLSec        int    `yaml:"nonce_ttl_sec"`
 	AdminTokenID       string `yaml:"admin_token_id"`
+	LegacyAPIEnabled   bool   `yaml:"legacy_api_enabled"`
 }
 
 // StorageConfig 定义数据存储相关的配置项。
@@ -86,7 +92,7 @@ func Default() *Config {
 	return &Config{
 		Server: ServerConfig{
 			Listen:            ":8443",
-			TLS:               false,
+			TLSMode:           "development",
 			BaseURL:           "http://localhost:8443",
 			ReadHeaderTimeout: 10 * time.Second,
 			ReadTimeout:       30 * time.Second,
@@ -97,6 +103,7 @@ func Default() *Config {
 			TimestampWindowSec: 300,
 			NonceTTLSec:        300,
 			AdminTokenID:       "admin",
+			LegacyAPIEnabled:   false,
 		},
 		Storage: StorageConfig{
 			SQLitePath:    "/data/db/certkeeper.db",
@@ -196,9 +203,32 @@ func (c *Config) Validate() error {
 	if c.Acme.CertsDir == "" {
 		return fmt.Errorf("acme.certs_dir 不能为空")
 	}
-	if c.Server.TLS {
+	if c.Server.TLSMode == "" {
+		if c.Server.TLS {
+			c.Server.TLSMode = "direct"
+		} else {
+			c.Server.TLSMode = "development"
+		}
+	}
+	if c.Server.TLSMode != "direct" && c.Server.TLSMode != "proxy" && c.Server.TLSMode != "development" {
+		return fmt.Errorf("server.tls_mode 必须为 direct、proxy 或 development")
+	}
+	if c.Server.TLSMode == "direct" {
 		if c.Server.CertFile == "" || c.Server.KeyFile == "" {
-			return fmt.Errorf("启用 TLS 时 cert_file 和 key_file 必填")
+			return fmt.Errorf("direct TLS 模式必须配置 cert_file 和 key_file")
+		}
+	}
+	if c.Server.TLSMode == "proxy" && len(c.Server.TrustedProxies) == 0 {
+		host, _, err := net.SplitHostPort(c.Server.Listen)
+		if err != nil || !isLoopbackHost(host) {
+			return fmt.Errorf("proxy TLS 模式仅允许 loopback 监听，或配置 trusted_proxies")
+		}
+	}
+	for _, proxy := range c.Server.TrustedProxies {
+		if net.ParseIP(proxy) == nil {
+			if _, _, err := net.ParseCIDR(proxy); err != nil {
+				return fmt.Errorf("trusted_proxies 包含无效地址: %s", proxy)
+			}
 		}
 	}
 	if c.Server.ReadHeaderTimeout < 0 || c.Server.ReadTimeout < 0 || c.Server.WriteTimeout < 0 || c.Server.IdleTimeout < 0 {
@@ -217,4 +247,12 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("scheduler.jitter 必须小于 scheduler.interval")
 	}
 	return nil
+}
+
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

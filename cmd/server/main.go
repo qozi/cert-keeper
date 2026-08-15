@@ -5,6 +5,8 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"errors"
 	"flag"
@@ -15,6 +17,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -29,11 +32,7 @@ import (
 	"github.com/siidoo/certkeeper/pkg/ckauth"
 )
 
-// systemTokenID 是内置系统 token 的 ID，仅供调度器执行协调使用，不用于 HTTP 认证。
-const systemTokenID = "system"
-
-// systemTokenGrants 是系统 token 在每个预置证书上需要的权限。
-var systemTokenGrants = []string{"apply", "status", "read_cert", "read_private_key"}
+var workerHeartbeat atomic.Int64
 
 func main() {
 	var (
@@ -118,19 +117,15 @@ func main() {
 	defer stopScheduler()
 	var schedulerDone chan struct{}
 	if cfg.Scheduler.Enabled {
-		if err := ensureSystemToken(context.Background(), st, logger); err != nil {
-			logger.Error("初始化系统 token 失败", "err", err)
-			os.Exit(1)
-		}
-		sched := scheduler.New(&schedulerWorker{svc: svc, tokenID: systemTokenID}, scheduler.Config{
-			Interval: cfg.Scheduler.Interval,
-			Jitter:   cfg.Scheduler.Jitter,
-			Observer: schedulerObserver(stdMetrics, logger),
+		worker := scheduler.NewPersistentWorker(&persistentStoreAdapter{store: st, cfg: cfg}, persistentReconciler{svc: svc}, scheduler.PersistentConfig{
+			Interval: cfg.Scheduler.Interval, Jitter: cfg.Scheduler.Jitter,
+			Actor:    scheduler.Actor{ID: "certificate-worker", Kind: "system"},
+			Observer: persistentObserver(stdMetrics, logger),
 		})
 		schedulerDone = make(chan struct{})
 		go func() {
 			defer close(schedulerDone)
-			if err := sched.Run(schedCtx); err != nil && !errors.Is(err, context.Canceled) {
+			if err := worker.Run(schedCtx); err != nil && !errors.Is(err, context.Canceled) {
 				logger.Warn("调度器异常退出", "err", err)
 			}
 		}()
@@ -144,9 +139,9 @@ func main() {
 	httpSrv := newHTTPServer(cfg, srv.Handler())
 
 	go func() {
-		logger.Info("HTTP 监听", "addr", cfg.Server.Listen, "tls", cfg.Server.TLS)
+		logger.Info("HTTP 监听", "addr", cfg.Server.Listen, "tls_mode", cfg.Server.TLSMode)
 		var err error
-		if cfg.Server.TLS {
+		if cfg.Server.TLSMode == "direct" {
 			err = httpSrv.ListenAndServeTLS(cfg.Server.CertFile, cfg.Server.KeyFile)
 		} else {
 			err = httpSrv.ListenAndServe()
@@ -183,6 +178,16 @@ func main() {
 
 // newHTTPServer 根据配置构造带超时设置的 HTTP 服务器。
 func newHTTPServer(cfg *config.Config, handler http.Handler) *http.Server {
+	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
+	if cfg.Server.ClientMTLS && cfg.Server.ClientCAFile != "" {
+		if data, err := os.ReadFile(cfg.Server.ClientCAFile); err == nil {
+			pool := x509.NewCertPool()
+			if pool.AppendCertsFromPEM(data) {
+				tlsConfig.ClientCAs = pool
+				tlsConfig.ClientAuth = tls.VerifyClientCertIfGiven
+			}
+		}
+	}
 	return &http.Server{
 		Addr:              cfg.Server.Listen,
 		Handler:           handler,
@@ -190,104 +195,71 @@ func newHTTPServer(cfg *config.Config, handler http.Handler) *http.Server {
 		ReadTimeout:       cfg.Server.ReadTimeout,
 		WriteTimeout:      cfg.Server.WriteTimeout,
 		IdleTimeout:       cfg.Server.IdleTimeout,
+		TLSConfig:         tlsConfig,
 	}
 }
 
-// schedulerWorker 将 service 的续期能力适配为 scheduler.Worker 接口。
-// 协调以系统 token 身份执行，不绕过 service 的域名 grant 检查。
-type schedulerWorker struct {
-	svc     *service.Service
-	tokenID string
+// persistentReconciler 将持久任务交给 service 的异步执行入口。
+type persistentReconciler struct{ svc *service.Service }
+
+func (r persistentReconciler) ReconcileJob(ctx context.Context, actor scheduler.Actor, job scheduler.Job) (scheduler.Result, error) {
+	return r.svc.ReconcileJob(ctx, actor, job)
 }
 
-// ListCandidates 返回全部预置证书的调度候选。
-func (w *schedulerWorker) ListCandidates(ctx context.Context) ([]scheduler.Candidate, error) {
-	return w.svc.ListRenewalCandidates(ctx)
+// persistentStoreAdapter 把 Store 的证书任务表适配为 scheduler 的 lease 契约。
+type persistentStoreAdapter struct {
+	store *store.Store
+	cfg   *config.Config
 }
 
-// Reconcile 对单个域名执行 v2 协调。幂等键按调用生成：
-// 同一轮内重复调用复用活动任务，跨轮次互不影响。
-func (w *schedulerWorker) Reconcile(ctx context.Context, domain string) (scheduler.Result, error) {
-	resp, err := w.svc.ReconcileV2(ctx, service.V2ReconcileRequest{
-		TokenID:        w.tokenID,
-		IsAdmin:        false,
-		Domain:         domain,
-		Operation:      "reconcile",
-		Reason:         "scheduler",
-		IdempotencyKey: fmt.Sprintf("scheduler-%d", time.Now().UnixNano()),
-	})
+func (a *persistentStoreAdapter) ListCandidates(ctx context.Context) ([]scheduler.Candidate, error) {
+	return service.New(a.cfg, a.store).ListRenewalCandidates(ctx)
+}
+
+func (a *persistentStoreAdapter) CreateJob(ctx context.Context, spec scheduler.JobSpec) (scheduler.Job, bool, error) {
+	job, err := a.store.CreateJob(ctx, &store.CertificateJob{Domain: spec.Candidate.Domain, Operation: "reconcile", IdempotencyKey: spec.IdempotencyKey, RequestedBy: store.JSONNullString{String: spec.Actor.ID, Valid: spec.Actor.ID != ""}, CreatedAt: spec.CreatedAt.Unix()})
 	if err != nil {
-		return scheduler.Result{}, err
+		return scheduler.Job{}, false, err
 	}
-	return scheduler.Result{Changed: resp.Changed, Message: resp.Message}, nil
+	return adapterJob(*job, spec.Candidate, spec.Actor), job.CreatedAt == spec.CreatedAt.Unix(), nil
 }
 
-// schedulerObserver 把每轮调度汇总写入 jobs 指标并记录日志，不包含域名等敏感标签。
-func schedulerObserver(std *observability.StandardMetrics, logger *slog.Logger) scheduler.Observer {
-	return scheduler.ObserverFunc(func(sum scheduler.Summary) {
-		if std != nil {
-			_ = std.Jobs.Add(observability.Labels{"job": "scheduler_reconcile", "status": "success"}, float64(sum.Succeeded))
-			_ = std.Jobs.Add(observability.Labels{"job": "scheduler_reconcile", "status": "failure"}, float64(sum.Failed))
-			_ = std.Jobs.Add(observability.Labels{"job": "scheduler_reconcile", "status": "skipped"}, float64(sum.Skipped))
-			// 候选项列表获取失败时没有产生任何逐域名结果，单独记一次列表失败。
-			if sum.Error != nil && sum.Attempted == 0 && len(sum.Results) == 0 {
-				_ = std.Jobs.Inc(observability.Labels{"job": "scheduler_list", "status": "failure"})
-			}
-		}
-		if logger != nil {
-			logger.Info("调度轮次完成",
-				"candidates", sum.Candidates, "attempted", sum.Attempted,
-				"succeeded", sum.Succeeded, "failed", sum.Failed, "skipped", sum.Skipped,
-				"duration_ms", sum.CompletedAt.Sub(sum.StartedAt).Milliseconds())
-		}
-	})
+func (a *persistentStoreAdapter) ClaimJob(ctx context.Context, req scheduler.ClaimRequest) (*scheduler.Job, error) {
+	job, err := a.store.ClaimJob(ctx, req.Owner, req.LeaseUntil.Sub(req.Now))
+	if err != nil || job == nil {
+		return nil, err
+	}
+	returnJob := adapterJob(*job, scheduler.Candidate{Domain: job.Domain, ChallengeMode: "dns_api"}, scheduler.Actor{ID: "certificate-worker", Kind: "system"})
+	return &returnJob, nil
 }
 
-// ensureSystemToken 确保内置系统 token 存在且处于启用状态，
-// 并对所有预置证书授予调度所需的权限（Grant 幂等，可重复执行）。
-// token secret 使用随机值，仅满足存储约束，不用于 HTTP，也不写入日志。
-func ensureSystemToken(ctx context.Context, st *store.Store, logger *slog.Logger) error {
-	t, err := st.GetToken(ctx, systemTokenID)
-	if err != nil {
-		return fmt.Errorf("读取系统 token 失败: %w", err)
-	}
-	switch {
-	case t == nil:
-		secret, err := ckauth.GenSecret()
-		if err != nil {
-			return fmt.Errorf("生成系统 token secret 失败: %w", err)
-		}
-		if err := st.CreateToken(ctx, &store.Token{
-			ID:        systemTokenID,
-			Secret:    secret,
-			Note:      "内置系统 token（调度器使用，不用于 HTTP）",
-			Enabled:   true,
-			IsAdmin:   false,
-			CreatedAt: time.Now().Unix(),
-		}); err != nil {
-			return fmt.Errorf("创建系统 token 失败: %w", err)
-		}
-		logger.Info("已创建内置系统 token", "id", systemTokenID)
-	case !t.Enabled:
-		// 调度依赖系统 token，启动时恢复启用状态。
-		if err := st.UpdateToken(ctx, systemTokenID, t.Note, true, t.IsAdmin); err != nil {
-			return fmt.Errorf("启用系统 token 失败: %w", err)
-		}
-		logger.Info("已重新启用内置系统 token", "id", systemTokenID)
-	}
-
-	certs, err := st.ListCerts(ctx)
-	if err != nil {
-		return fmt.Errorf("列出证书配置失败: %w", err)
-	}
-	for _, c := range certs {
-		for _, perm := range systemTokenGrants {
-			if err := st.Grant(ctx, systemTokenID, c.Domain, perm); err != nil {
-				return fmt.Errorf("授予系统 token 权限失败(%s %s): %w", c.Domain, perm, err)
-			}
-		}
-	}
+func (a *persistentStoreAdapter) RenewLease(ctx context.Context, renewal scheduler.LeaseRenewal) (bool, error) {
+	err := a.store.RenewLease(ctx, renewal.ID, renewal.Owner, renewal.LeaseUntil.Sub(renewal.Now))
+	return err == nil, err
+}
+func (a *persistentStoreAdapter) UpdateJob(ctx context.Context, update scheduler.JobUpdate) (bool, error) {
+	status := string(update.Status)
+	err := a.store.UpdateJobStatus(ctx, update.ID, status, update.LastError)
+	return err == nil, err
+}
+func (a *persistentStoreAdapter) RecordSkippedCandidate(ctx context.Context, record scheduler.SkipRecord) error {
 	return nil
+}
+func adapterJob(job store.CertificateJob, candidate scheduler.Candidate, actor scheduler.Actor) scheduler.Job {
+	return scheduler.Job{ID: job.ID, Candidate: candidate, Actor: actor, IdempotencyKey: job.IdempotencyKey, Status: scheduler.JobStatus(job.Status), Attempts: job.Attempts, MaxAttempts: job.MaxAttempts, LeaseOwner: job.LeaseOwner}
+}
+
+func persistentObserver(std *observability.StandardMetrics, logger *slog.Logger) scheduler.PersistentObserver {
+	return scheduler.PersistentObserverFunc(func(sum scheduler.PersistentSummary) {
+		if std != nil {
+			_ = std.Jobs.Add(observability.Labels{"job": "persistent_worker", "status": "claimed"}, float64(sum.Claimed))
+			_ = std.Jobs.Add(observability.Labels{"job": "persistent_worker", "status": "failed"}, float64(sum.Failed))
+		}
+		workerHeartbeat.Store(time.Now().Unix())
+		if logger != nil {
+			logger.Info("持久 worker 轮次完成", "claimed", sum.Claimed, "succeeded", sum.Succeeded, "failed", sum.Failed)
+		}
+	})
 }
 
 // registerReadinessChecks 注册就绪检查：数据库连通性与关键目录可写。
@@ -297,10 +269,35 @@ func registerReadinessChecks(registry *observability.Registry, cfg *config.Confi
 	}); err != nil {
 		return err
 	}
+	if err := registry.RegisterReadiness("store_encryption", st.CheckEncryptionReadiness); err != nil {
+		return err
+	}
 	if err := registry.RegisterReadiness("acme_home_writable", dirWritableCheck(cfg.Acme.Home)); err != nil {
 		return err
 	}
 	if err := registry.RegisterReadiness("certs_dir_writable", dirWritableCheck(cfg.Acme.CertsDir)); err != nil {
+		return err
+	}
+	if err := registry.RegisterReadiness("acme_config", func(context.Context) error {
+		if cfg.Acme.AcmeShPath == "" || cfg.Acme.Home == "" {
+			return errors.New("ACME 配置不完整")
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	if err := registry.RegisterReadiness("worker_heartbeat", func(context.Context) error {
+		if cfg.Scheduler.Enabled && workerHeartbeat.Load() == 0 {
+			return errors.New("worker 尚未完成首轮运行")
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	if err := registry.RegisterReadiness("renewal_backlog", func(ctx context.Context) error {
+		_, err := st.ListRecoverable(ctx, time.Now(), 1)
+		return err
+	}); err != nil {
 		return err
 	}
 	return nil

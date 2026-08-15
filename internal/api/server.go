@@ -69,31 +69,32 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("/healthz", methodHandler([]string{http.MethodGet}, http.HandlerFunc(s.healthz)))
 
-	// 客户端 API（需 client token）
-	mux.Handle("/api/v1/client/register", methodHandler([]string{http.MethodPost}, s.authed(s.registerClient)))
-	mux.Handle("/api/v1/client/heartbeat", methodHandler([]string{http.MethodPost}, s.authed(s.heartbeat)))
-	mux.Handle("/api/v1/certs/apply", methodHandler([]string{http.MethodPost}, s.authed(s.applyCert)))
-	mux.Handle("/api/v1/certs/", methodHandler([]string{http.MethodGet}, s.authed(s.certSubtree)))
-	mux.Handle("/api/v1/ping", methodHandler([]string{http.MethodGet}, s.authed(s.ping)))
-
-	// 管理 API（需 admin token）
-	tokens := routeMethodHandler(adminTokenMethods, s.admin(s.tokensHandler))
-	mux.Handle("/api/v1/admin/tokens", tokens)
-	mux.Handle("/api/v1/admin/tokens/", tokens)
-	certs := routeMethodHandler(adminCertMethods, s.admin(s.certsAdminHandler))
-	mux.Handle("/api/v1/admin/certs", certs)
-	mux.Handle("/api/v1/admin/certs/", certs)
-	secrets := routeMethodHandler(adminSecretMethods, s.admin(s.secretsHandler))
-	mux.Handle("/api/v1/admin/secrets", secrets)
-	mux.Handle("/api/v1/admin/secrets/", secrets)
-	providers := routeMethodHandler(adminProviderMethods, s.admin(s.providersHandler))
-	mux.Handle("/api/v1/admin/providers", providers)
-	mux.Handle("/api/v1/admin/providers/", providers)
-	mux.Handle("/api/v1/admin/clients", methodHandler([]string{http.MethodGet}, s.admin(s.clientsHandler)))
-	mux.Handle("/api/v1/admin/logs", methodHandler([]string{http.MethodGet}, s.admin(s.logsHandler)))
+	if s.Cfg.Auth.LegacyAPIEnabled {
+		// v1 仅在显式开启时注册，避免旧接口绕过 v2 授权模型。
+		mux.Handle("/api/v1/client/register", methodHandler([]string{http.MethodPost}, s.authed(s.registerClient)))
+		mux.Handle("/api/v1/client/heartbeat", methodHandler([]string{http.MethodPost}, s.authed(s.heartbeat)))
+		mux.Handle("/api/v1/certs/apply", methodHandler([]string{http.MethodPost}, s.authed(s.applyCert)))
+		mux.Handle("/api/v1/certs/", methodHandler([]string{http.MethodGet}, s.authed(s.certSubtree)))
+		mux.Handle("/api/v1/ping", methodHandler([]string{http.MethodGet}, s.authed(s.ping)))
+		tokens := routeMethodHandler(adminTokenMethods, s.admin(s.tokensHandler))
+		mux.Handle("/api/v1/admin/tokens", tokens)
+		mux.Handle("/api/v1/admin/tokens/", tokens)
+		certs := routeMethodHandler(adminCertMethods, s.admin(s.certsAdminHandler))
+		mux.Handle("/api/v1/admin/certs", certs)
+		mux.Handle("/api/v1/admin/certs/", certs)
+		secrets := routeMethodHandler(adminSecretMethods, s.admin(s.secretsHandler))
+		mux.Handle("/api/v1/admin/secrets", secrets)
+		mux.Handle("/api/v1/admin/secrets/", secrets)
+		providers := routeMethodHandler(adminProviderMethods, s.admin(s.providersHandler))
+		mux.Handle("/api/v1/admin/providers", providers)
+		mux.Handle("/api/v1/admin/providers/", providers)
+		mux.Handle("/api/v1/admin/clients", methodHandler([]string{http.MethodGet}, s.admin(s.clientsHandler)))
+		mux.Handle("/api/v1/admin/logs", methodHandler([]string{http.MethodGet}, s.admin(s.logsHandler)))
+	}
 
 	// v2 公共 API（需 client token；写操作不强制 admin，由 service 按域名 grant 决定）
 	s.registerV2Routes(mux)
+	mux.Handle("/api/v2/capabilities", methodHandler([]string{http.MethodGet}, http.HandlerFunc(s.capabilities)))
 
 	// 可观测性端点无需鉴权，面向内网监控系统，由配置开关控制是否暴露。
 	metricsEnabled := s.Metrics != nil && s.Cfg.Observability.MetricsEnabled

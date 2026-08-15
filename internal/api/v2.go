@@ -4,7 +4,9 @@
 package api
 
 import (
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 
 	"github.com/siidoo/certkeeper/internal/service"
@@ -35,6 +37,17 @@ type v2CertOp struct {
 	domain     string // 证书主域名路径段
 	generation string // generation 路径段（仅 manifest/file 操作）
 	fileName   string // 文件名路径段（仅 file 操作）
+}
+
+// capabilities 返回客户端进行协议协商所需的运行能力。
+func (s *Server) capabilities(w http.ResponseWriter, _ *http.Request) {
+	caps := certproto.DefaultCapabilities()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"api_version": caps.APIVersion, "async_jobs": caps.AsyncJobs,
+		"job_polling": caps.JobPolling, "dns_api": true,
+		"legacy_enabled": s.Cfg.Auth.LegacyAPIEnabled, "tls_mode": s.Cfg.Server.TLSMode,
+		"urls": caps.URLs,
+	})
 }
 
 // parseV2CertPath 解析 /api/v2/certs 之后的路径段，识别操作并做段数与非空校验。
@@ -115,19 +128,18 @@ func (s *Server) v2JobsHandler(w http.ResponseWriter, r *http.Request) {
 // v2ReconcileReq 是 v2 reconcile 的请求体。
 // 请求体刻意不包含 token_id/is_admin：调用方身份只来自已认证的 token，
 // body 中即便携带同名字段也会在反序列化时被忽略。
-type v2ReconcileReq struct {
-	IdempotencyKey string `json:"idempotency_key"`
-	Force          bool   `json:"force"`
-	Operation      string `json:"operation"`
-	Reason         string `json:"reason"`
-}
-
 // v2Reconcile 处理 POST /api/v2/certs/{domain}/reconcile。
 // TokenID/IsAdmin 从 ctx 中已认证的 token 注入；force 的权限由 service 层校验。
 func (s *Server) v2Reconcile(w http.ResponseWriter, r *http.Request, domain string) {
-	var req v2ReconcileReq
-	if err := readJSON(r, &req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体格式错误"})
+	var req certproto.ReconcileRequest
+	decoder := json.NewDecoder(io.LimitReader(r.Body, maxRequestBodySize+1))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, certproto.ErrorResponse{Code: certproto.ErrorCodeInvalidRequest, Message: "请求体格式错误"})
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		writeJSON(w, http.StatusBadRequest, certproto.ErrorResponse{Code: certproto.ErrorCodeInvalidRequest, Message: "请求体格式错误"})
 		return
 	}
 	t := tokenFromCtx(r)
@@ -144,7 +156,11 @@ func (s *Server) v2Reconcile(w http.ResponseWriter, r *http.Request, domain stri
 		s.writeV2Error(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, resp)
+	path, _ := certproto.JobURLPath(resp.Job.ID)
+	accepted := certproto.JobAcceptedResponse{Job: resp.Job, Location: path}
+	w.Header().Set(certproto.JobLocationHeader, path)
+	w.Header().Set(certproto.JobRetryAfterHeader, "5")
+	writeJSON(w, certproto.ReconcileAcceptedHTTPStatus, accepted)
 }
 
 // v2Status 处理 GET /api/v2/certs/{domain}/status。
@@ -194,6 +210,10 @@ func (s *Server) v2Deployments(w http.ResponseWriter, r *http.Request, domain st
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体格式错误"})
 		return
 	}
+	if err := report.ValidateForDomain(domain); err != nil {
+		s.writeV2Error(w, err)
+		return
+	}
 	t := tokenFromCtx(r)
 	if err := s.service().ReportDeploymentV2(r.Context(), t.ID, domain, report); err != nil {
 		s.writeV2Error(w, err)
@@ -218,11 +238,14 @@ func (s *Server) v2Job(w http.ResponseWriter, r *http.Request, jobID string) {
 func (s *Server) writeV2Error(w http.ResponseWriter, err error) {
 	var validationErr *service.ValidationError
 	var permErr *service.PermissionError
+	var protocolErr *certproto.ErrorResponse
 	switch {
+	case errors.As(err, &protocolErr):
+		writeJSON(w, certproto.HTTPStatusForErrorCode(protocolErr.Code), protocolErr)
 	case errors.As(err, &validationErr):
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": validationErr.Message})
 	case errors.As(err, &permErr):
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": permErr.Message})
+		writeJSON(w, http.StatusForbidden, certproto.ErrorResponse{Code: certproto.ErrorCodeForbidden, Message: permErr.Message})
 	default:
 		if s.Logger != nil {
 			s.Logger.Error("v2 请求处理失败", "err", err.Error())
