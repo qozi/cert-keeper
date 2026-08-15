@@ -143,7 +143,7 @@ func (s *Store) getTokenWithSecret(ctx context.Context, id string) (*Token, erro
 	if version != tokenSecretVersion {
 		return nil, fmt.Errorf("不支持的 token secret 版本: %d", version)
 	}
-	secret, err := decryptAESGCM(ciphertext, s.kek, tokenSecretAAD(id))
+	secret, err := s.decryptStoredSecret(ciphertext, tokenSecretAAD(id))
 	if err != nil {
 		return nil, fmt.Errorf("解密 token secret 失败: %w", err)
 	}

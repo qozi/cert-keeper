@@ -264,8 +264,8 @@ func TestJobIdempotencyAndWorkflowCRUD(t *testing.T) {
 		t.Fatal(err)
 	}
 	next, err := st.CreateCertificateJob(ctx, &CertificateJob{Domain: "example.com", Operation: "issue", IdempotencyKey: "request-1"})
-	if err != nil || next.ID == job.ID {
-		t.Fatalf("终态任务不应阻止后续重试: next=%+v err=%v", next, err)
+	if err != nil || next.ID != job.ID || next.Status != "succeeded" {
+		t.Fatalf("终态任务必须保持幂等: next=%+v err=%v", next, err)
 	}
 
 	generation, err := st.CreateCertificateGeneration(ctx, &CertificateGeneration{JobID: next.ID, Domain: "example.com"})

@@ -14,6 +14,7 @@ type Cert struct {
 	CA            string         `json:"ca"`
 	ChallengeMode string         `json:"challenge_mode"`
 	DNSProvider   JSONNullString `json:"dns_provider"`
+	DNSProfile    JSONNullString `json:"dns_profile"`
 	WebrootPath   JSONNullString `json:"webroot_path"`
 	Keylength     string         `json:"keylength"`
 	RenewDays     int            `json:"renew_days"`
@@ -25,18 +26,37 @@ type Cert struct {
 
 // UpsertCert 创建或更新证书配置。
 func (s *Store) UpsertCert(ctx context.Context, c *Cert) error {
+	if c == nil {
+		return sql.ErrNoRows
+	}
+	if c.DNSProfile.Valid {
+		if !c.DNSProvider.Valid {
+			return &certificateConfigError{message: "DNS profile 必须同时指定 provider"}
+		}
+		if err := validateDNSProfile(c.DNSProvider.String, c.DNSProfile.String); err != nil {
+			return err
+		}
+		var exists int
+		if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM dns_profiles WHERE provider=? AND profile=?`,
+			c.DNSProvider.String, c.DNSProfile.String).Scan(&exists); err != nil {
+			return err
+		}
+		if exists == 0 {
+			return &certificateConfigError{message: "引用的 DNS profile 不存在"}
+		}
+	}
 	now := time.Now().Unix()
 	c.CreatedAt = now
 	c.UpdatedAt = now
 	_, err := s.DB.ExecContext(ctx,
-		`INSERT INTO certs(domain, san, ca, challenge_mode, dns_provider, webroot_path, keylength, renew_days, reload_cmd, created_at, updated_at, source)
-		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO certs(domain, san, ca, challenge_mode, dns_provider, dns_profile, webroot_path, keylength, renew_days, reload_cmd, created_at, updated_at, source)
+		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(domain) DO UPDATE SET
 		   san=excluded.san, ca=excluded.ca, challenge_mode=excluded.challenge_mode,
-		   dns_provider=excluded.dns_provider, webroot_path=excluded.webroot_path,
+		   dns_provider=excluded.dns_provider, dns_profile=excluded.dns_profile, webroot_path=excluded.webroot_path,
 		   keylength=excluded.keylength, renew_days=excluded.renew_days,
 		   reload_cmd=excluded.reload_cmd, updated_at=excluded.updated_at, source=excluded.source`,
-		c.Domain, c.SAN, c.CA, c.ChallengeMode, c.DNSProvider, c.WebrootPath,
+		c.Domain, c.SAN, c.CA, c.ChallengeMode, c.DNSProvider, c.DNSProfile, c.WebrootPath,
 		c.Keylength, c.RenewDays, c.ReloadCmd, c.CreatedAt, c.UpdatedAt, c.Source)
 	return err
 }
@@ -45,9 +65,9 @@ func (s *Store) UpsertCert(ctx context.Context, c *Cert) error {
 func (s *Store) GetCert(ctx context.Context, domain string) (*Cert, error) {
 	var c Cert
 	err := s.DB.QueryRowContext(ctx,
-		`SELECT domain, san, ca, challenge_mode, dns_provider, webroot_path, keylength, renew_days, reload_cmd, created_at, updated_at, source
+		`SELECT domain, san, ca, challenge_mode, dns_provider, dns_profile, webroot_path, keylength, renew_days, reload_cmd, created_at, updated_at, source
 		 FROM certs WHERE domain=?`, domain).
-		Scan(&c.Domain, &c.SAN, &c.CA, &c.ChallengeMode, &c.DNSProvider, &c.WebrootPath,
+		Scan(&c.Domain, &c.SAN, &c.CA, &c.ChallengeMode, &c.DNSProvider, &c.DNSProfile, &c.WebrootPath,
 			&c.Keylength, &c.RenewDays, &c.ReloadCmd, &c.CreatedAt, &c.UpdatedAt, &c.Source)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -61,7 +81,7 @@ func (s *Store) GetCert(ctx context.Context, domain string) (*Cert, error) {
 // ListCerts 列出所有证书配置。
 func (s *Store) ListCerts(ctx context.Context) ([]*Cert, error) {
 	rows, err := s.DB.QueryContext(ctx,
-		`SELECT domain, san, ca, challenge_mode, dns_provider, webroot_path, keylength, renew_days, reload_cmd, created_at, updated_at, source
+		`SELECT domain, san, ca, challenge_mode, dns_provider, dns_profile, webroot_path, keylength, renew_days, reload_cmd, created_at, updated_at, source
 		 FROM certs ORDER BY domain`)
 	if err != nil {
 		return nil, err
@@ -70,7 +90,7 @@ func (s *Store) ListCerts(ctx context.Context) ([]*Cert, error) {
 	var out []*Cert
 	for rows.Next() {
 		var c Cert
-		if err := rows.Scan(&c.Domain, &c.SAN, &c.CA, &c.ChallengeMode, &c.DNSProvider, &c.WebrootPath,
+		if err := rows.Scan(&c.Domain, &c.SAN, &c.CA, &c.ChallengeMode, &c.DNSProvider, &c.DNSProfile, &c.WebrootPath,
 			&c.Keylength, &c.RenewDays, &c.ReloadCmd, &c.CreatedAt, &c.UpdatedAt, &c.Source); err != nil {
 			return nil, err
 		}
@@ -78,6 +98,10 @@ func (s *Store) ListCerts(ctx context.Context) ([]*Cert, error) {
 	}
 	return out, rows.Err()
 }
+
+type certificateConfigError struct{ message string }
+
+func (e *certificateConfigError) Error() string { return e.message }
 
 // DeleteCert 根据域名删除证书配置。
 func (s *Store) DeleteCert(ctx context.Context, domain string) error {

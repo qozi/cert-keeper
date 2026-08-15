@@ -95,6 +95,13 @@ func (s *Store) ListDNSProfiles(ctx context.Context, provider string) ([]DNSProf
 
 // DeleteDNSProfile 删除指定 profile 及其全部机密。
 func (s *Store) DeleteDNSProfile(ctx context.Context, provider, profile string) error {
+	var references int
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM certs WHERE dns_provider=? AND dns_profile=?`, provider, profile).Scan(&references); err != nil {
+		return err
+	}
+	if references > 0 {
+		return errors.New("DNS profile 仍被证书配置引用")
+	}
 	_, err := s.DB.ExecContext(ctx, `DELETE FROM dns_profiles WHERE provider=? AND profile=?`, provider, profile)
 	return err
 }
@@ -163,7 +170,7 @@ func (s *Store) ListDNSProfileSecretsWithValues(ctx context.Context, provider, p
 		if err := rows.Scan(&envKey, &ciphertext); err != nil {
 			return nil, err
 		}
-		value, err := decryptAESGCM(ciphertext, s.kek, dnsSecretAAD(provider, profile, envKey))
+		value, err := s.decryptStoredSecret(ciphertext, dnsSecretAAD(provider, profile, envKey))
 		if err != nil {
 			return nil, fmt.Errorf("解密 DNS secret 失败: %w", err)
 		}

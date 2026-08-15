@@ -3,6 +3,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"embed"
 	"errors"
@@ -20,8 +21,12 @@ var migrationsFS embed.FS
 
 // Store 是数据存储的核心结构，封装 SQLite 数据库连接。
 type Store struct {
-	DB  *sql.DB
-	kek []byte
+	DB         *sql.DB
+	path       string
+	kek        []byte
+	legacyKEK  []byte
+	keySource  string
+	keyVersion int
 }
 
 // Open 打开或创建指定路径的 SQLite 数据库，并执行必要的迁移。
@@ -33,7 +38,7 @@ func Open(path string) (*Store, error) {
 	if err := chmodIfSupported(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("收紧数据库目录权限失败: %w", err)
 	}
-	kek, err := loadOrCreateKEK(path + ".kek")
+	kek, keySource, keyVersion, legacyKEK, err := loadEncryptionKey(path)
 	if err != nil {
 		return nil, fmt.Errorf("加载数据库密钥失败: %w", err)
 	}
@@ -47,12 +52,36 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("ping SQLite 失败: %w", err)
 	}
-	s := &Store{DB: db, kek: kek}
+	s := &Store{
+		DB:         db,
+		path:       path,
+		kek:        kek,
+		legacyKEK:  legacyKEK,
+		keySource:  keySource,
+		keyVersion: keyVersion,
+	}
 	if err := s.migrate(); err != nil {
+		s.clearKeys()
 		_ = db.Close()
 		return nil, err
 	}
+	if err := s.migrateLegacyCiphertexts(context.Background()); err != nil {
+		s.clearKeys()
+		_ = db.Close()
+		return nil, fmt.Errorf("迁移数据库密文失败: %w", err)
+	}
+	if err := s.CheckEncryptionReadiness(context.Background()); err != nil {
+		s.clearKeys()
+		_ = db.Close()
+		return nil, err
+	}
+	if err := s.saveKeyMetadata(context.Background()); err != nil {
+		s.clearKeys()
+		_ = db.Close()
+		return nil, fmt.Errorf("保存数据库密钥元数据失败: %w", err)
+	}
 	if err := secureDatabaseFiles(path); err != nil {
+		s.clearKeys()
 		_ = db.Close()
 		return nil, err
 	}
@@ -60,7 +89,10 @@ func Open(path string) (*Store, error) {
 }
 
 // Close 关闭数据库连接。
-func (s *Store) Close() error { return s.DB.Close() }
+func (s *Store) Close() error {
+	s.clearKeys()
+	return s.DB.Close()
+}
 
 func (s *Store) migrate() error {
 	entries, err := migrationsFS.ReadDir("migrations")
