@@ -16,7 +16,7 @@ import (
 )
 
 // TestApplyAutoFallsBackToV1 覆盖服务端不支持 v2（404）时自动回退 v1 申请流程。
-func TestApplyAutoFallsBackToV1(t *testing.T) {
+func TestApplyAutoRejectsMissingCapabilities(t *testing.T) {
 	t.Parallel()
 	domain := "example.test"
 	files := map[string][]byte{
@@ -41,21 +41,8 @@ func TestApplyAutoFallsBackToV1(t *testing.T) {
 		FullchainFile: "fullchain.pem",
 		CAFile:        "ca.pem",
 	}
-	if err := applyAuto(cli, v2Opts, v1Opts, false); err != nil {
-		t.Fatalf("applyAuto 回退 v1 失败: %v", err)
-	}
-	if v2Hits.Load() == 0 {
-		t.Fatal("回退前应先尝试 v2 reconcile")
-	}
-	// v1 流程把文件直接下载到输出目录。
-	for name, want := range files {
-		got, err := os.ReadFile(filepath.Join(outDir, name))
-		if err != nil {
-			t.Fatalf("读取 %s 失败: %v", name, err)
-		}
-		if string(got) != string(want) {
-			t.Fatalf("%s 内容 = %q，期望 %q", name, got, want)
-		}
+	if err := applyAuto(cli, v2Opts, v1Opts, false); err == nil {
+		t.Fatal("缺少 capabilities 时必须拒绝")
 	}
 }
 
@@ -96,7 +83,7 @@ func TestApplyAutoForcedV1(t *testing.T) {
 }
 
 // TestStatusAutoFallsBackToV1 覆盖 status 在 v2 不可用时回退 v1。
-func TestStatusAutoFallsBackToV1(t *testing.T) {
+func TestStatusAutoRejectsMissingCapabilities(t *testing.T) {
 	t.Parallel()
 	domain := "example.test"
 	mux := http.NewServeMux()
@@ -110,13 +97,13 @@ func TestStatusAutoFallsBackToV1(t *testing.T) {
 	server := httptest.NewServer(mux)
 	defer server.Close()
 
-	if err := statusAuto(newTestClient(server.URL), domain, false); err != nil {
-		t.Fatalf("statusAuto 回退 v1 失败: %v", err)
+	if err := statusAuto(newTestClient(server.URL), domain, false); err == nil {
+		t.Fatal("缺少 capabilities 时必须拒绝")
 	}
 }
 
 // TestDownloadAutoFallsBackToV1 覆盖 download 在 v2 不可用时回退 v1。
-func TestDownloadAutoFallsBackToV1(t *testing.T) {
+func TestDownloadAutoRejectsMissingCapabilities(t *testing.T) {
 	t.Parallel()
 	domain := "example.test"
 	content := []byte("cert data")
@@ -135,15 +122,8 @@ func TestDownloadAutoFallsBackToV1(t *testing.T) {
 	defer server.Close()
 
 	out := filepath.Join(t.TempDir(), "cert.pem")
-	if err := downloadAuto(newTestClient(server.URL), domain, "", "cert.pem", out, false); err != nil {
-		t.Fatalf("downloadAuto 回退 v1 失败: %v", err)
-	}
-	got, err := os.ReadFile(out)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(got) != string(content) {
-		t.Fatalf("下载内容 = %q，期望 %q", got, content)
+	if err := downloadAuto(newTestClient(server.URL), domain, "", "cert.pem", out, false); err == nil {
+		t.Fatal("缺少 capabilities 时必须拒绝")
 	}
 }
 
@@ -182,7 +162,7 @@ func v1OnlyMux(t *testing.T, domain string, files map[string][]byte, v2Hits *ato
 // newTestClient 构造指向测试服务端的客户端。
 func newTestClient(serverURL string) *client.Client {
 	return &client.Client{
-		Cfg:  &client.Config{Server: serverURL, TokenID: "test-id", TokenSecret: "test-secret"},
+		Cfg:  &client.Config{Server: serverURL, TokenID: "test-id", TokenSecret: "test-secret", Development: true},
 		HTTP: &http.Client{},
 		Log:  testLogger{},
 	}

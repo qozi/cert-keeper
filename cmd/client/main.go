@@ -4,7 +4,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -48,7 +47,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "加载配置失败: %v\n", err)
 		os.Exit(1)
 	}
-	logger := setupLogger(cfg, false)
+	quiet = scanQuietArg(os.Args[2:])
+	logger := setupLogger(cfg, quiet)
 	cli := &client.Client{
 		Cfg:  cfg,
 		HTTP: &http.Client{Timeout: 5 * time.Minute},
@@ -80,12 +80,13 @@ func main() {
 		runRegister(cli, os.Args[2:], makeGlobal)
 	case "test":
 		runTest(cli, os.Args[2:], makeGlobal)
+	case "heartbeat":
+		runHeartbeat(cli, os.Args[2:], makeGlobal)
 	default:
 		fmt.Fprintf(os.Stderr, "未知命令: %s\n", command)
 		printUsage()
 		os.Exit(1)
 	}
-	_ = quiet
 }
 
 // 包级全局变量（被各子命令 fs 与 applyGlobalOverrides 共用）
@@ -114,6 +115,15 @@ func scanConfigArg(args []string) string {
 	return cfg
 }
 
+func scanQuietArg(args []string) bool {
+	for _, arg := range args {
+		if arg == "--quiet" {
+			return true
+		}
+	}
+	return false
+}
+
 func applyGlobalOverrides(cli *client.Client, server, tokenID, secret, logFile, logLevel string) {
 	if server != "" {
 		cli.Cfg.Server = server
@@ -134,6 +144,9 @@ func applyGlobalOverrides(cli *client.Client, server, tokenID, secret, logFile, 
 
 func loadConfig(path string) (*client.Config, error) {
 	cfg := &client.Config{}
+	if info, err := os.Stat(path); err == nil && info.Mode().Perm()&0o077 != 0 {
+		return nil, fmt.Errorf("配置文件权限过宽，必须不允许组或其他用户访问")
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -161,12 +174,12 @@ func setupLogger(cfg *client.Config, quiet bool) *slog.Logger {
 	}
 	var w *os.File = os.Stdout
 	if !quiet && cfg.LogFile != "" {
-		f, err := os.OpenFile(cfg.LogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		f, err := os.OpenFile(cfg.LogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 		if err == nil {
 			w = f
 		}
 	} else if quiet && cfg.LogFile != "" {
-		f, err := os.OpenFile(cfg.LogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		f, err := os.OpenFile(cfg.LogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 		if err == nil {
 			w = f
 		}
@@ -181,7 +194,8 @@ func printUsage() {
   apply      申请/续签证书并下载到本地
   download   仅下载已签发证书
   status     查询某证书状态
-  register   注册客户端到服务端
+	register   注册客户端到服务端
+	heartbeat  更新客户端在线时间
   test       测试与服务端连接
 
 全局 flags:
@@ -196,7 +210,7 @@ func printUsage() {
 
 apply flags:
   -d DOMAIN       主域名（必填，可多次指定；附加域名仅 v1 生效）
-  --v1            强制使用 v1 旧流程（默认 v2，服务端不支持时自动回退）
+  --v1            显式使用 v1 旧流程
   --mode M        dns_api/standalone/webroot/dns_manual（仅 v1）
   --dns-provider P   dns_api 模式（仅 v1）
   --webroot P     webroot 模式（仅 v1）
@@ -213,14 +227,14 @@ apply flags:
 
 status flags:
   -d DOMAIN       主域名（必填）
-  --v1            强制使用 v1 旧流程（默认 v2，服务端不支持时自动回退）
+  --v1            显式使用 v1 旧流程
 
 download flags:
   -d DOMAIN       主域名（必填）
   -f FILE         文件名 (cert.pem/key.pem/fullchain.pem/ca.pem/time.log)
   -o PATH         输出路径
   -g GEN          v2 generation（默认取服务端 current，仅 v2）
-  --v1            强制使用 v1 旧流程（默认 v2，服务端不支持时自动回退）
+  --v1            显式使用 v1 旧流程
 
 示例:
   certkeeper-client apply -d example.com --out-dir /etc/nginx/certs \
@@ -229,6 +243,21 @@ download flags:
 }
 
 type globalRegFn func(fs *flag.FlagSet)
+
+func runHeartbeat(cli *client.Client, args []string, makeGlobal globalRegFn) {
+	fs := flag.NewFlagSet("heartbeat", flag.ExitOnError)
+	makeGlobal(fs)
+	_ = fs.Parse(args)
+	applyGlobalOverrides(cli, server, tokenID, secret, logFile, logLevel)
+	if err := requireAuth(cli); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if err := cli.Heartbeat(context.Background()); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
 
 func runTest(cli *client.Client, args []string, makeGlobal globalRegFn) {
 	fs := flag.NewFlagSet("test", flag.ExitOnError)
@@ -348,17 +377,12 @@ func runApply(cli *client.Client, args []string, logger *slog.Logger, makeGlobal
 	}
 }
 
-// applyAuto 默认走 v2 reconcile + generation 原子部署；服务端不支持 v2 时回退 v1。
-// useV1 为 true 时强制使用 v1 旧流程。
+// applyAuto 默认走 v2；只有显式 --v1 才使用旧流程。
 func applyAuto(cli *client.Client, v2Opts client.ApplyV2Opts, v1Opts client.ApplyOpts, useV1 bool) error {
 	if useV1 {
 		return cli.Apply(v1Opts)
 	}
 	err := cli.ApplyV2(context.Background(), v2Opts)
-	if errors.Is(err, client.ErrV2NotSupported) {
-		fmt.Fprintln(os.Stderr, "提示: 服务端不支持 v2 API，回退到 v1 申请流程")
-		return cli.Apply(v1Opts)
-	}
 	return err
 }
 
@@ -394,17 +418,12 @@ func runDownload(cli *client.Client, args []string, makeGlobal globalRegFn) {
 	}
 }
 
-// downloadAuto 默认走 v2 下载；服务端不支持 v2 时回退 v1。
-// useV1 为 true 时强制使用 v1 旧流程。
+// downloadAuto 默认走 v2；只有显式 --v1 才使用旧流程。
 func downloadAuto(cli *client.Client, domain, generation, fileName, outPath string, useV1 bool) error {
 	if useV1 {
 		return cli.Download(domain, fileName, outPath)
 	}
 	err := cli.DownloadV2(domain, generation, fileName, outPath)
-	if errors.Is(err, client.ErrV2NotSupported) {
-		fmt.Fprintln(os.Stderr, "提示: 服务端不支持 v2 API，回退到 v1 下载流程")
-		return cli.Download(domain, fileName, outPath)
-	}
 	return err
 }
 
@@ -433,17 +452,12 @@ func runStatus(cli *client.Client, args []string, makeGlobal globalRegFn) {
 	}
 }
 
-// statusAuto 默认走 v2 状态查询；服务端不支持 v2 时回退 v1。
-// useV1 为 true 时强制使用 v1 旧流程。
+// statusAuto 默认走 v2；只有显式 --v1 才使用旧流程。
 func statusAuto(cli *client.Client, domain string, useV1 bool) error {
 	if useV1 {
 		return cli.Status(domain)
 	}
 	err := cli.StatusV2(domain)
-	if errors.Is(err, client.ErrV2NotSupported) {
-		fmt.Fprintln(os.Stderr, "提示: 服务端不支持 v2 API，回退到 v1 状态查询")
-		return cli.Status(domain)
-	}
 	return err
 }
 

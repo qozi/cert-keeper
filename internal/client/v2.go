@@ -4,20 +4,20 @@ package client
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/siidoo/certkeeper/pkg/certproto"
 	"github.com/siidoo/certkeeper/pkg/ckauth"
 )
-
-// ErrV2NotSupported 表示服务端未实现 v2 API（HTTP 404/501），调用方可据此回退 v1 流程。
-var ErrV2NotSupported = errors.New("服务端不支持 v2 API")
 
 // ApplyV2Opts 定义 v2 reconcile + generation 原子部署的选项。
 type ApplyV2Opts struct {
@@ -36,7 +36,7 @@ type ApplyV2Opts struct {
 }
 
 // ApplyV2 通过 v2 reconcile 申请/续签证书，并以 generation 原子部署到本地。
-// 部署完成后向服务端回报 DeploymentReport；回报失败仅记录警告，不影响本地结果。
+// 部署完成后向服务端回报 DeploymentReport；回报失败会持久化并在下次运行补发。
 func (c *Client) ApplyV2(ctx context.Context, opts ApplyV2Opts) error {
 	if opts.Domain == "" {
 		return errors.New("域名不能为空")
@@ -54,11 +54,41 @@ func (c *Client) ApplyV2(ctx context.Context, opts ApplyV2Opts) error {
 		idempotencyKey = key
 	}
 
+	if err := c.ensureCapabilities(ctx); err != nil {
+		return err
+	}
+	statePath := filepath.Join(opts.OutDir, ".client-state.json")
+	state, err := loadClientState(statePath)
+	if err != nil {
+		return err
+	}
+	if state != nil && state.Domain == opts.Domain && state.IdempotencyKey != "" {
+		idempotencyKey = state.IdempotencyKey
+	}
+	previousState := state
+	state = &clientState{IdempotencyKey: idempotencyKey, Domain: opts.Domain}
+	if previousState != nil && previousState.Domain == opts.Domain && previousState.Report != nil && !previousState.ReportSent {
+		state.Report = previousState.Report
+	}
+	if err := saveClientState(statePath, state); err != nil {
+		return err
+	}
+	if state.Report != nil && !state.ReportSent && state.Report.Domain == opts.Domain {
+		if err := c.reportDeploymentV2(ctx, opts.Domain, *state.Report); err == nil {
+			state.ReportSent = true
+			if err := saveClientState(statePath, state); err != nil {
+				return err
+			}
+		}
+	}
 	reconcile, err := c.reconcileV2(ctx, opts, idempotencyKey)
 	if err != nil {
 		return err
 	}
 	generation := reconcile.Generation
+	if generation == "" {
+		generation = reconcile.Job.Generation
+	}
 	if generation == "" {
 		return errors.New("服务端未返回有效 generation")
 	}
@@ -95,9 +125,18 @@ func (c *Client) ApplyV2(ctx context.Context, opts ApplyV2Opts) error {
 	report.StartedAt = &startedAt
 	report.FinishedAt = &finishedAt
 
-	// 回报部署结果；回报失败不影响本地部署结果。
+	report.Domain = opts.Domain
+	report.Generation = generation
+	state.Generation = generation
+	state.Revision = reconcile.Revision
+	state.Report = &report
+	_ = saveClientState(statePath, state)
+	// 回报失败必须保留状态，供下次运行补发。
 	if reportErr := c.reportDeploymentV2(ctx, opts.Domain, report); reportErr != nil {
-		c.Log.Warn("部署回报失败（不影响本地部署结果）", "err", reportErr)
+		c.Log.Warn("部署回报失败，将在下次运行补发", "err", reportErr)
+	} else {
+		state.ReportSent = true
+		_ = saveClientState(statePath, state)
 	}
 
 	if deployErr != nil {
@@ -131,10 +170,17 @@ func (c *Client) reconcileV2(ctx context.Context, opts ApplyV2Opts, idempotencyK
 	if err != nil {
 		return nil, err
 	}
-	if isV2UnsupportedStatus(resp.StatusCode) {
-		return nil, fmt.Errorf("%w: reconcile 返回 %d", ErrV2NotSupported, resp.StatusCode)
+	if resp.StatusCode == http.StatusAccepted {
+		var accepted certproto.JobAcceptedResponse
+		if err := json.Unmarshal(data, &accepted); err != nil {
+			return nil, fmt.Errorf("解析异步任务响应失败: %w", err)
+		}
+		if err := accepted.Validate(); err != nil {
+			return nil, fmt.Errorf("异步任务响应无效: %w", err)
+		}
+		return c.pollJobV2(ctx, accepted.Location, accepted.Job)
 	}
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("reconcile 失败: 服务端返回 %d: %s", resp.StatusCode, string(data))
 	}
 	var rr certproto.ReconcileResponse
@@ -150,6 +196,32 @@ func (c *Client) reconcileV2(ctx context.Context, opts ApplyV2Opts, idempotencyK
 	return &rr, nil
 }
 
+func (c *Client) pollJobV2(ctx context.Context, location string, initial certproto.JobStatus) (*certproto.ReconcileResponse, error) {
+	job := initial
+	for {
+		if job.IsTerminal() {
+			if job.State != certproto.JobStateSucceeded {
+				return nil, fmt.Errorf("异步任务 %s: %s", job.State, job.Message)
+			}
+			return &certproto.ReconcileResponse{Success: true, Generation: job.Generation, Revision: job.Revision, Job: job}, nil
+		}
+		delay := 100 * time.Millisecond
+		if delayErr := sleepContext(ctx, delay); delayErr != nil {
+			return nil, delayErr
+		}
+		resp, data, err := c.doRequestCtx(ctx, http.MethodGet, location, nil)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("轮询任务失败: 服务端返回 %d: %s", resp.StatusCode, string(data))
+		}
+		if err := json.Unmarshal(data, &job); err != nil {
+			return nil, fmt.Errorf("解析任务状态失败: %w", err)
+		}
+	}
+}
+
 // manifestV2 按 generation 获取证书 manifest。
 func (c *Client) manifestV2(ctx context.Context, domain string, generation certproto.GenerationID) (certproto.CertificateManifest, error) {
 	path, err := certproto.ManifestURLPath(domain, string(generation))
@@ -159,9 +231,6 @@ func (c *Client) manifestV2(ctx context.Context, domain string, generation certp
 	resp, data, err := c.doRequestCtx(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return nil, err
-	}
-	if isV2UnsupportedStatus(resp.StatusCode) {
-		return nil, fmt.Errorf("%w: manifest 返回 %d", ErrV2NotSupported, resp.StatusCode)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("获取 manifest 失败: 服务端返回 %d: %s", resp.StatusCode, string(data))
@@ -210,6 +279,45 @@ func (c *Client) reportDeploymentV2(ctx context.Context, domain string, report c
 	return nil
 }
 
+// ensureCapabilities 在所有 v2 操作开始前验证服务端冻结能力。
+func (c *Client) ensureCapabilities(ctx context.Context) error {
+	resp, data, err := c.doRequestCtx(ctx, http.MethodGet, certproto.CapabilitiesURLPath(), nil)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("获取 capabilities 失败: 服务端返回 %d: %s", resp.StatusCode, string(data))
+	}
+	var caps certproto.Capabilities
+	if err := json.Unmarshal(data, &caps); err != nil {
+		return fmt.Errorf("capabilities 无效: %w", err)
+	}
+	return nil
+}
+
+// Heartbeat 向服务端报告客户端仍在线。
+func (c *Client) Heartbeat(ctx context.Context) error {
+	resp, data, err := c.doRequestCtx(ctx, http.MethodPost, "/api/v1/client/heartbeat", map[string]any{})
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("heartbeat %d: %s", resp.StatusCode, string(data))
+	}
+	return nil
+}
+
+func sleepContext(ctx context.Context, delay time.Duration) error {
+	t := time.NewTimer(delay)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
 // certificateStatusV2 获取并解析 v2 证书状态。
 func (c *Client) certificateStatusV2(ctx context.Context, domain string) (*certproto.CertificateStatus, error) {
 	path, err := certproto.CertificateStatusURLPath(domain)
@@ -219,9 +327,6 @@ func (c *Client) certificateStatusV2(ctx context.Context, domain string) (*certp
 	resp, data, err := c.doRequestCtx(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return nil, err
-	}
-	if isV2UnsupportedStatus(resp.StatusCode) {
-		return nil, fmt.Errorf("%w: status 返回 %d", ErrV2NotSupported, resp.StatusCode)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, string(data))
@@ -235,6 +340,9 @@ func (c *Client) certificateStatusV2(ctx context.Context, domain string) (*certp
 
 // StatusV2 通过 v2 API 查询证书状态并打印。
 func (c *Client) StatusV2(domain string) error {
+	if err := c.ensureCapabilities(context.Background()); err != nil {
+		return err
+	}
 	status, err := c.certificateStatusV2(context.Background(), domain)
 	if err != nil {
 		return err
@@ -249,6 +357,10 @@ func (c *Client) StatusV2(domain string) error {
 
 // DownloadV2 下载指定 generation 的单个证书文件；generation 为空时使用服务端 current generation。
 func (c *Client) DownloadV2(domain, generation, fileName, outPath string) error {
+	ctx := context.Background()
+	if err := c.ensureCapabilities(ctx); err != nil {
+		return err
+	}
 	if err := certproto.ValidateFileName(fileName); err != nil {
 		return fmt.Errorf("不允许下载文件 %q: %w", fileName, err)
 	}
@@ -262,6 +374,20 @@ func (c *Client) DownloadV2(domain, generation, fileName, outPath string) error 
 			return errors.New("服务端没有可用的 current generation")
 		}
 	}
+	manifest, err := c.manifestV2(ctx, domain, certproto.GenerationID(generation))
+	if err != nil {
+		return err
+	}
+	var expected certproto.FileManifest
+	for _, item := range manifest {
+		if item.Name == fileName {
+			expected = item
+			break
+		}
+	}
+	if expected.Name == "" {
+		return fmt.Errorf("manifest 中不存在文件 %q", fileName)
+	}
 	path, err := certproto.CertificateFileURLPath(domain, generation, fileName)
 	if err != nil {
 		return err
@@ -270,14 +396,42 @@ func (c *Client) DownloadV2(domain, generation, fileName, outPath string) error 
 	if err != nil {
 		return err
 	}
-	if isV2UnsupportedStatus(resp.StatusCode) {
-		return fmt.Errorf("%w: 文件下载返回 %d", ErrV2NotSupported, resp.StatusCode)
-	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("download %d: %s", resp.StatusCode, string(data))
 	}
-	if err := os.WriteFile(outPath, data, 0o600); err != nil {
-		return fmt.Errorf("写入失败: %w", err)
+	if int64(len(data)) != expected.Size {
+		return errors.New("下载大小校验失败")
+	}
+	digest := sha256.Sum256(data)
+	if hex.EncodeToString(digest[:]) != expected.SHA256 {
+		return errors.New("下载 SHA256 校验失败")
+	}
+	if info, err := os.Lstat(outPath); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("输出路径不能是符号链接")
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(outPath), ".download-")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, outPath); err != nil {
+		return fmt.Errorf("原子替换失败: %w", err)
 	}
 	fmt.Printf("已下载 %s (generation %s) -> %s (%d 字节)\n", fileName, generation, outPath, len(data))
 	return nil
@@ -304,9 +458,4 @@ func deploymentTarget() string {
 		host = host[:128]
 	}
 	return host
-}
-
-// isV2UnsupportedStatus 判断状态码是否表示服务端未实现 v2 API。
-func isV2UnsupportedStatus(code int) bool {
-	return code == http.StatusNotFound || code == http.StatusNotImplemented
 }

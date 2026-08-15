@@ -255,8 +255,8 @@ func TestApplyV2UnsupportedServer(t *testing.T) {
 		}))
 		cli := testV1Client(server.URL)
 		err := cli.ApplyV2(context.Background(), ApplyV2Opts{Domain: "example.test", OutDir: t.TempDir()})
-		if !errors.Is(err, ErrV2NotSupported) {
-			t.Fatalf("状态 %d 应返回 ErrV2NotSupported，实际: %v", code, err)
+		if err == nil {
+			t.Fatalf("状态 %d 应失败", code)
 		}
 		server.Close()
 	}
@@ -307,15 +307,15 @@ func TestV2EndpointsUnsupported(t *testing.T) {
 	defer server.Close()
 
 	cli := testV1Client(server.URL)
-	if err := cli.StatusV2("example.test"); !errors.Is(err, ErrV2NotSupported) {
-		t.Fatalf("StatusV2 应返回 ErrV2NotSupported，实际: %v", err)
+	if err := cli.StatusV2("example.test"); err == nil {
+		t.Fatal("StatusV2 应失败")
 	}
 	out := filepath.Join(t.TempDir(), "cert.pem")
-	if err := cli.DownloadV2("example.test", "", "cert.pem", out); !errors.Is(err, ErrV2NotSupported) {
-		t.Fatalf("DownloadV2 应返回 ErrV2NotSupported，实际: %v", err)
+	if err := cli.DownloadV2("example.test", "", "cert.pem", out); err == nil {
+		t.Fatal("DownloadV2 应失败")
 	}
-	if err := cli.DownloadV2("example.test", "gen-1", "cert.pem", out); !errors.Is(err, ErrV2NotSupported) {
-		t.Fatalf("DownloadV2 显式 generation 应返回 ErrV2NotSupported，实际: %v", err)
+	if err := cli.DownloadV2("example.test", "gen-1", "cert.pem", out); err == nil {
+		t.Fatal("DownloadV2 应失败")
 	}
 }
 
@@ -374,6 +374,10 @@ func (f *fakeV2Server) handler() http.Handler {
 	if err != nil {
 		f.t.Fatal(err)
 	}
+	jobPath, err := certproto.JobURLPath("job-1")
+	if err != nil {
+		f.t.Fatal(err)
+	}
 	// 由合法文件路径推导出 files 前缀，用于前缀路由。
 	certPath, err := certproto.CertificateFileURLPath(f.domain, string(f.generation), string(certproto.FileCert))
 	if err != nil {
@@ -381,7 +385,11 @@ func (f *fakeV2Server) handler() http.Handler {
 	}
 	filesPrefix := strings.TrimSuffix(certPath, string(certproto.FileCert))
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET "+certproto.CapabilitiesURLPath(), func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(certproto.DefaultCapabilities())
+	})
 	mux.HandleFunc("POST "+reconcilePath, f.handleReconcile)
+	mux.HandleFunc("GET "+jobPath, f.handleJob)
 	mux.HandleFunc("GET "+statusPath, f.handleStatus)
 	mux.HandleFunc("GET "+manifestPath, f.handleManifest)
 	mux.HandleFunc("GET "+filesPrefix, f.handleFile)
@@ -408,6 +416,7 @@ func (f *fakeV2Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 		Generation: f.generation,
 		Revision:   1,
 		Changed:    true,
+		Job:        certproto.JobStatus{ID: "job-1", State: certproto.JobStateSucceeded, Generation: f.generation, Revision: 1, CreatedAt: time.Now()},
 		Status: certproto.CertificateStatus{
 			Domain:     f.domain,
 			Generation: f.generation,
@@ -418,9 +427,21 @@ func (f *fakeV2Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 			Exists:     true,
 		},
 	}
+	if f.reconcileStatus == http.StatusAccepted {
+		job := certproto.JobStatus{ID: "job-1", State: certproto.JobStateQueued, CreatedAt: time.Now()}
+		accepted := certproto.JobAcceptedResponse{Job: job, Location: "/api/v2/jobs/job-1"}
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(accepted)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(f.reconcileStatus)
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func (f *fakeV2Server) handleJob(w http.ResponseWriter, r *http.Request) {
+	job := certproto.JobStatus{ID: "job-1", State: certproto.JobStateSucceeded, Generation: f.generation, Revision: 1, CreatedAt: time.Now()}
+	_ = json.NewEncoder(w).Encode(job)
 }
 
 func (f *fakeV2Server) handleStatus(w http.ResponseWriter, r *http.Request) {

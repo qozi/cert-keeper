@@ -8,11 +8,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/siidoo/certkeeper/pkg/certproto"
@@ -21,12 +24,14 @@ import (
 
 // Config 定义客户端的配置。
 type Config struct {
-	Server      string   `yaml:"server"`
-	TokenID     string   `yaml:"token_id"`
-	TokenSecret string   `yaml:"token_secret"`
-	LogFile     string   `yaml:"log_file"`
-	LogLevel    string   `yaml:"log_level"`
-	Defaults    Defaults `yaml:"defaults"`
+	Server       string   `yaml:"server"`
+	TokenID      string   `yaml:"token_id"`
+	TokenSecret  string   `yaml:"token_secret"`
+	LogFile      string   `yaml:"log_file"`
+	LogLevel     string   `yaml:"log_level"`
+	Development  bool     `yaml:"development"`
+	InsecureHTTP bool     `yaml:"insecure_http"`
+	Defaults     Defaults `yaml:"defaults"`
 }
 
 // Defaults 定义客户端的默认配置。
@@ -42,9 +47,23 @@ type Defaults struct {
 
 // Client 是 CertKeeper 客户端，负责与服务端通信。
 type Client struct {
-	Cfg  *Config
-	HTTP *http.Client
-	Log  Logger
+	Cfg      *Config
+	HTTP     *http.Client
+	Log      Logger
+	RetryMin time.Duration
+	RetryMax time.Duration
+}
+
+// ValidateServer 校验服务端地址；生产配置必须使用 HTTPS。
+func (c *Client) ValidateServer() error {
+	u, err := url.Parse(c.Cfg.Server)
+	if err != nil || u.Host == "" {
+		return errors.New("服务端地址无效")
+	}
+	if u.Scheme != "https" && !(u.Scheme == "http" && (c.Cfg.Development || c.Cfg.InsecureHTTP)) {
+		return errors.New("服务端必须使用 HTTPS；仅 development/insecure_http 配置可允许 HTTP")
+	}
+	return nil
 }
 
 // Logger 是日志记录器接口。
@@ -95,6 +114,9 @@ func (c *Client) doRequest(method, path string, body any) (*http.Response, []byt
 
 // doRequestCtx 发送带 HMAC 签名的请求，并支持通过 ctx 取消。
 func (c *Client) doRequestCtx(ctx context.Context, method, path string, body any) (*http.Response, []byte, error) {
+	if err := c.ValidateServer(); err != nil {
+		return nil, nil, err
+	}
 	var bodyBytes []byte
 	var bodyHash = "0"
 	if body != nil {
@@ -120,13 +142,60 @@ func (c *Client) doRequestCtx(ctx context.Context, method, path string, body any
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return nil, nil, err
+	min, max := c.RetryMin, c.RetryMax
+	if min <= 0 {
+		min = 100 * time.Millisecond
 	}
-	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
-	return resp, data, err
+	if max <= 0 {
+		max = 5 * time.Second
+	}
+	for attempt := 0; ; attempt++ {
+		if attempt > 0 && req.GetBody != nil {
+			body, err := req.GetBody()
+			if err != nil {
+				return nil, nil, err
+			}
+			req.Body = body
+		}
+		resp, err := c.HTTP.Do(req)
+		if err != nil {
+			if attempt >= 5 {
+				return nil, nil, err
+			}
+			if err := sleepContext(ctx, backoffDelay(min, max, attempt)); err != nil {
+				return nil, nil, err
+			}
+			continue
+		}
+		data, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			if attempt >= 5 {
+				return resp, nil, readErr
+			}
+			continue
+		}
+		if (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500) && attempt < 5 {
+			delay := backoffDelay(min, max, attempt)
+			if value, err := strconv.Atoi(resp.Header.Get("Retry-After")); err == nil && value >= 0 {
+				delay = time.Duration(value) * time.Second
+			}
+			if err := sleepContext(ctx, delay); err != nil {
+				return nil, nil, err
+			}
+			continue
+		}
+		return resp, data, nil
+	}
+}
+
+func backoffDelay(min, max time.Duration, attempt int) time.Duration {
+	delay := min << attempt
+	if delay > max {
+		delay = max
+	}
+	// 使用固定上限内的轻微抖动，避免并发客户端同一时刻重试。
+	return delay + time.Duration((attempt*37)%100)*delay/1000
 }
 
 // Apply 申请/续签证书并下载到本地。

@@ -288,7 +288,6 @@ func TestDeployGenerationUsesPrivatePermissions(t *testing.T) {
 		}
 	}
 	for _, path := range []string{
-		filepath.Join(outDir, "current"),
 		filepath.Join(outDir, "releases", "generation-1", string(certproto.FileKey)),
 	} {
 		info, err := os.Stat(path)
@@ -456,6 +455,13 @@ func sha256Hex(data []byte) string {
 
 func readCurrentForTest(t *testing.T, outDir string) string {
 	t.Helper()
+	if info, err := os.Lstat(filepath.Join(outDir, "current")); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		target, err := os.Readlink(filepath.Join(outDir, "current"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return filepath.Base(target)
+	}
 	data, err := os.ReadFile(filepath.Join(outDir, "current"))
 	if err != nil {
 		t.Fatal(err)
@@ -465,7 +471,7 @@ func readCurrentForTest(t *testing.T, outDir string) string {
 
 func testV1Client(serverURL string) *Client {
 	return &Client{
-		Cfg:  &Config{Server: serverURL, TokenID: "test-id", TokenSecret: "test-secret"},
+		Cfg:  &Config{Server: serverURL, TokenID: "test-id", TokenSecret: "test-secret", Development: true},
 		HTTP: &http.Client{Timeout: time.Second},
 		Log:  discardLogger{},
 	}

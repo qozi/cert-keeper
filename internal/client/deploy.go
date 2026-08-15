@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/siidoo/certkeeper/pkg/certproto"
-	"golang.org/x/sys/unix"
 )
 
 // FetchCertificateFileFunc 按固定文件名获取 generation 的单个文件。
@@ -238,41 +237,6 @@ func ensureSecureDirectory(path string) error {
 		return errors.New("路径必须是非符号链接目录")
 	}
 	return os.Chmod(path, 0o700)
-}
-
-func lockDeployment(ctx context.Context, outDir string) (*os.File, error) {
-	lockPath := filepath.Join(outDir, ".deploy.lock")
-	if info, err := os.Lstat(lockPath); err == nil {
-		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-			return nil, errors.New("部署锁必须是普通文件")
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("检查部署锁失败: %w", err)
-	}
-	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return nil, fmt.Errorf("打开部署锁失败: %w", err)
-	}
-	if err := lock.Chmod(0o600); err != nil {
-		_ = lock.Close()
-		return nil, fmt.Errorf("设置部署锁权限失败: %w", err)
-	}
-	for {
-		err = unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB)
-		if err == nil {
-			return lock, nil
-		}
-		if !errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EAGAIN) {
-			_ = lock.Close()
-			return nil, fmt.Errorf("获取部署锁失败: %w", err)
-		}
-		select {
-		case <-ctx.Done():
-			_ = lock.Close()
-			return nil, fmt.Errorf("等待部署锁取消: %w", ctx.Err())
-		case <-time.After(10 * time.Millisecond):
-		}
-	}
 }
 
 func writeAndValidateStagedFile(dir string, fileName certproto.FileName, item certproto.FileManifest, data []byte) error {
@@ -498,8 +462,19 @@ func readDeploymentCurrent(outDir string) (certproto.GenerationID, bool, error) 
 	if err != nil {
 		return "", false, fmt.Errorf("读取 current 失败: %w", err)
 	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return "", false, errors.New("current 必须是非符号链接普通文件")
+	if info.Mode()&os.ModeSymlink != 0 {
+		target, err := os.Readlink(path)
+		if err != nil || filepath.IsAbs(target) || filepath.Clean(target) != target || filepath.Dir(target) != "releases" {
+			return "", false, errors.New("current 符号链接目标无效")
+		}
+		generation := certproto.GenerationID(filepath.Base(target))
+		if err := generation.Validate(); err != nil {
+			return "", false, err
+		}
+		return generation, true, nil
+	}
+	if !info.Mode().IsRegular() {
+		return "", false, errors.New("current 必须是普通文件或受管符号链接")
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -518,31 +493,15 @@ func writeDeploymentCurrent(outDir string, generation certproto.GenerationID) er
 	}
 	currentPath := filepath.Join(outDir, "current")
 	if info, err := os.Lstat(currentPath); err == nil {
-		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-			return errors.New("current 必须是非符号链接普通文件")
+		if info.Mode()&os.ModeSymlink == 0 && !info.Mode().IsRegular() {
+			return errors.New("current 必须是普通文件或受管符号链接")
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	temporary, err := os.CreateTemp(outDir, ".current-")
-	if err != nil {
-		return err
-	}
-	temporaryPath := temporary.Name()
-	defer func() { _ = os.Remove(temporaryPath) }()
-	if err := temporary.Chmod(0o600); err != nil {
-		_ = temporary.Close()
-		return err
-	}
-	if _, err := temporary.WriteString(string(generation) + "\n"); err != nil {
-		_ = temporary.Close()
-		return err
-	}
-	if err := temporary.Sync(); err != nil {
-		_ = temporary.Close()
-		return err
-	}
-	if err := temporary.Close(); err != nil {
+	temporaryPath := filepath.Join(outDir, ".current-"+string(generation))
+	_ = os.Remove(temporaryPath)
+	if err := os.Symlink(filepath.Join("releases", string(generation)), temporaryPath); err != nil {
 		return err
 	}
 	if err := os.Rename(temporaryPath, currentPath); err != nil {
@@ -563,8 +522,8 @@ func restoreDeploymentCurrent(outDir string, previous certproto.GenerationID, ha
 	if err != nil {
 		return err
 	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return errors.New("current 必须是非符号链接普通文件")
+	if info.Mode()&os.ModeSymlink == 0 && !info.Mode().IsRegular() {
+		return errors.New("current 必须是普通文件或受管符号链接")
 	}
 	if err := os.Remove(path); err != nil {
 		return err
