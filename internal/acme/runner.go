@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -23,14 +24,17 @@ var (
 	dnsProviderName = regexp.MustCompile(`^dns_[a-z0-9]+(?:_[a-z0-9]+)*$`)
 	domainName      = regexp.MustCompile(`^(?:\*\.)?[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$`)
 	environmentName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	profileName     = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`)
+	caName          = regexp.MustCompile(`^[a-z][a-z0-9._-]{0,63}$`)
 )
 
 // Runner 封装 acme.sh 调用，提供证书签发和管理功能。
 type Runner struct {
 	AcmeShPath          string
-	Home                string
+	Home                string // 兼容字段，作为 acme.sh --home 和默认持久 config-home
+	StateHome           string // 可选的 acme.sh --home；为空时使用 Home
 	CertsDir            string
-	ConfigHome          string
+	ConfigHome          string // 持久账户、CA 和域名状态目录；为空时使用 StateHome/Home
 	EphemeralConfigHome bool
 	Timeout             time.Duration
 	OutputLimit         int
@@ -48,6 +52,15 @@ type IssueParams struct {
 	Keylength     string
 	DNSEnv        map[string]string // 已解密的环境变量
 	CertsDir      string            // 可选，指定本次签发产物的根目录
+	StagingDir    string            // 可选，指定本次安装产物的准确目录
+	Profile       string            // DNS 凭据 profile 标识，不传递给 acme.sh
+	Env           map[string]string // DNSEnv 的新名称，优先与 DNSEnv 合并
+	KeyType       string            // 可选：ecc 或 rsa
+	Staging       bool              // 使用 ACME CA 的 staging 端点
+	EABKID        string            // External Account Binding 的 KID
+	EABHMACKey    string            // External Account Binding 的 HMAC key
+	EABKid        string            // EABKID 的兼容拼写
+	EABHmacKey    string            // EABHMACKey 的兼容拼写
 }
 
 // OperationStatus 表示 acme.sh 操作的归类状态。
@@ -108,10 +121,18 @@ func (e *OperationError) Unwrap() error {
 
 // OperationParams 定义已有证书的生命周期操作参数。
 type OperationParams struct {
-	Domain    string
-	CA        string
-	Keylength string
-	DNSEnv    map[string]string
+	Domain     string
+	CA         string
+	Keylength  string
+	DNSEnv     map[string]string
+	Profile    string
+	Env        map[string]string
+	KeyType    string
+	Staging    bool
+	EABKID     string
+	EABHMACKey string
+	EABKid     string
+	EABHmacKey string
 }
 
 // RenewParams 是续签参数的语义别名。
@@ -154,25 +175,28 @@ func (r *Runner) Issue(ctx context.Context, p *IssueParams) (*IssueResult, error
 	started := time.Now()
 	cctx, cancel := r.withTimeout(ctx)
 	defer cancel()
+	res, err := r.issueWithContext(cctx, p)
+	if res != nil {
+		res.Duration = time.Since(started)
+	}
+	if err != nil {
+		return res, safeError(err, issueEnv(p))
+	}
+	return res, nil
+}
 
-	certsDir := r.CertsDir
-	if p.CertsDir != "" {
-		certsDir = p.CertsDir
-	}
-	if certsDir == "" {
-		return nil, errors.New("证书目录不能为空")
-	}
-	if err := os.MkdirAll(certsDir, 0o755); err != nil {
-		return nil, fmt.Errorf("创建证书目录失败: %w", err)
-	}
-	outDir := filepath.Join(certsDir, p.Domain)
-	if err := os.MkdirAll(outDir, 0o755); err != nil {
-		return nil, fmt.Errorf("创建域名证书目录失败: %w", err)
+func (r *Runner) issueWithContext(cctx context.Context, p *IssueParams) (*IssueResult, error) {
+	started := time.Now()
+
+	outDir, certsDir, err := r.outputDir(p)
+	if err != nil {
+		return nil, err
 	}
 
 	res := &IssueResult{Domain: p.Domain, OutDir: outDir}
-	err := r.withIsolatedConfig(cctx, "issue", p.DNSEnv, []string{certsDir}, func(configHome string) error {
-		issue, issueErr := r.execute(cctx, "issue", r.buildIssueArgs(p), p.DNSEnv, configHome)
+	env := issueEnv(p)
+	err = r.withIsolatedConfig(cctx, "issue", env, []string{certsDir}, func(configHome, accountConf string) error {
+		issue, issueErr := r.execute(cctx, "issue", r.buildIssueArgs(p), env, configHome, accountConf)
 		res.Issue = issue
 		res.Status = issue.Status
 		res.StdoutStderr = r.combineOutput(issue)
@@ -180,7 +204,7 @@ func (r *Runner) Issue(ctx context.Context, p *IssueParams) (*IssueResult, error
 			return issueErr
 		}
 
-		install, installErr := r.installCert(cctx, p, outDir, configHome)
+		install, installErr := r.installCert(cctx, p, outDir, configHome, accountConf)
 		res.Install = install
 		res.Status = install.Status
 		res.StdoutStderr = r.combineOutput(issue, install)
@@ -197,10 +221,41 @@ func (r *Runner) Issue(ctx context.Context, p *IssueParams) (*IssueResult, error
 		return nil
 	})
 	res.Duration = time.Since(started)
-	if err != nil {
-		return res, safeError(err, p.DNSEnv)
+	return res, err
+}
+
+// IssueOrRenew 首次调用使用 issue，检测到持久 config-home 中已有域名状态时使用 renew。
+// 可选 force 参数为 true 时，已有证书续签会带 --force；省略时等同于 false。
+func (r *Runner) IssueOrRenew(ctx context.Context, p *IssueParams, force ...bool) (*IssueResult, error) {
+	if len(force) > 1 {
+		return nil, errors.New("force 参数只能提供一次")
 	}
-	return res, nil
+	if p == nil {
+		return nil, errors.New("签发或续签参数无效: 参数不能为空")
+	}
+	if err := validateRenewInstallParams(p); err != nil {
+		return nil, fmt.Errorf("签发或续签参数无效: %w", err)
+	}
+	if err := r.validateReady(); err != nil {
+		return nil, err
+	}
+	cctx, cancel := r.withTimeout(ctx)
+	defer cancel()
+	if r.hasDomainState(p.Domain, p.KeyType, p.Keylength) {
+		result, err := r.renewAndInstallWithContext(cctx, p, len(force) == 1 && force[0])
+		if err != nil {
+			return result, safeError(err, issueEnv(p))
+		}
+		return result, nil
+	}
+	if err := validateChallengeParams(p); err != nil {
+		return nil, fmt.Errorf("签发或续签参数无效: %w", err)
+	}
+	result, err := r.issueWithContext(cctx, p)
+	if err != nil {
+		return result, safeError(err, issueEnv(p))
+	}
+	return result, nil
 }
 
 // Renew 续签已有证书。退出码 2 表示跳过，退出码 3 表示等待人工处理。
@@ -236,9 +291,9 @@ func (r *Runner) Version(ctx context.Context) (*OperationResult, error) {
 	cctx, cancel := r.withTimeout(ctx)
 	defer cancel()
 	var result OperationResult
-	err := r.withIsolatedConfig(cctx, "version", nil, nil, func(configHome string) error {
+	err := r.withIsolatedConfig(cctx, "version", nil, nil, func(configHome, accountConf string) error {
 		var executeErr error
-		result, executeErr = r.execute(cctx, "version", []string{"--version"}, nil, configHome)
+		result, executeErr = r.execute(cctx, "version", []string{"--version"}, nil, configHome, accountConf)
 		return executeErr
 	})
 	return &result, err
@@ -257,30 +312,34 @@ func (r *Runner) RenewAndInstall(ctx context.Context, p *IssueParams, force bool
 	started := time.Now()
 	cctx, cancel := r.withTimeout(ctx)
 	defer cancel()
-	certsDir := r.CertsDir
-	if p.CertsDir != "" {
-		certsDir = p.CertsDir
+	res, err := r.renewAndInstallWithContext(cctx, p, force)
+	if res != nil {
+		res.Duration = time.Since(started)
 	}
-	if certsDir == "" {
-		return nil, errors.New("证书目录不能为空")
+	if err != nil {
+		return res, safeError(err, issueEnv(p))
 	}
-	if err := os.MkdirAll(certsDir, 0o755); err != nil {
-		return nil, fmt.Errorf("创建证书目录失败: %w", err)
-	}
-	outDir := filepath.Join(certsDir, p.Domain)
-	if err := os.MkdirAll(outDir, 0o755); err != nil {
-		return nil, fmt.Errorf("创建域名证书目录失败: %w", err)
+	return res, nil
+}
+
+func (r *Runner) renewAndInstallWithContext(cctx context.Context, p *IssueParams, force bool) (*IssueResult, error) {
+	started := time.Now()
+	outDir, certsDir, err := r.outputDir(p)
+	if err != nil {
+		return nil, err
 	}
 
 	res := &IssueResult{Domain: p.Domain, OutDir: outDir}
-	err := r.withIsolatedConfig(cctx, "renew", p.DNSEnv, []string{certsDir}, func(configHome string) error {
+	env := issueEnv(p)
+	err = r.withIsolatedConfig(cctx, "renew", env, []string{certsDir}, func(configHome, accountConf string) error {
 		args := r.appendCertificateOptions([]string{"--renew", "-d", p.Domain}, &OperationParams{
-			Domain: p.Domain, CA: p.CA, Keylength: p.Keylength,
+			Domain: p.Domain, CA: p.CA, Keylength: p.Keylength, KeyType: p.KeyType, Staging: p.Staging,
+			EABKID: p.EABKID, EABHMACKey: p.EABHMACKey, EABKid: p.EABKid, EABHmacKey: p.EABHmacKey,
 		})
 		if force {
 			args = insertForce(args)
 		}
-		renew, renewErr := r.execute(cctx, "renew", args, p.DNSEnv, configHome)
+		renew, renewErr := r.execute(cctx, "renew", args, env, configHome, accountConf)
 		res.Issue = renew
 		res.Status = renew.Status
 		res.StdoutStderr = r.combineOutput(renew)
@@ -291,7 +350,7 @@ func (r *Runner) RenewAndInstall(ctx context.Context, p *IssueParams, force bool
 			return nil
 		}
 
-		install, installErr := r.installCert(cctx, p, outDir, configHome)
+		install, installErr := r.installCert(cctx, p, outDir, configHome, accountConf)
 		res.Install = install
 		res.StdoutStderr = r.combineOutput(renew, install)
 		if installErr != nil || install.Status != OperationSucceeded {
@@ -312,10 +371,34 @@ func (r *Runner) RenewAndInstall(ctx context.Context, p *IssueParams, force bool
 		return nil
 	})
 	res.Duration = time.Since(started)
-	if err != nil {
-		return res, safeError(err, p.DNSEnv)
+	return res, err
+}
+
+// InstallCert 仅执行安装步骤，将已有证书复制到 StagingDir 或 CertsDir/<domain>。
+func (r *Runner) InstallCert(ctx context.Context, p *IssueParams) (*OperationResult, error) {
+	if err := validateRenewInstallParams(p); err != nil {
+		return nil, fmt.Errorf("安装参数无效: %w", err)
 	}
-	return res, nil
+	if err := r.validateReady(); err != nil {
+		return nil, err
+	}
+	outDir, certsDir, err := r.outputDir(p)
+	if err != nil {
+		return nil, err
+	}
+	cctx, cancel := r.withTimeout(ctx)
+	defer cancel()
+	var result OperationResult
+	env := issueEnv(p)
+	err = r.withIsolatedConfig(cctx, "install-cert", env, []string{certsDir}, func(configHome, accountConf string) error {
+		var executeErr error
+		result, executeErr = r.installCert(cctx, p, outDir, configHome, accountConf)
+		return executeErr
+	})
+	if err != nil {
+		return &result, safeError(err, env)
+	}
+	return &result, nil
 }
 
 func (r *Runner) certificateOperation(ctx context.Context, operation string, p *OperationParams, force bool) (*OperationResult, error) {
@@ -333,12 +416,13 @@ func (r *Runner) certificateOperation(ctx context.Context, operation string, p *
 	cctx, cancel := r.withTimeout(ctx)
 	defer cancel()
 	var result OperationResult
-	err := r.withIsolatedConfig(cctx, operation, p.DNSEnv, []string{r.CertsDir}, func(configHome string) error {
+	env := operationEnv(p)
+	err := r.withIsolatedConfig(cctx, operation, env, []string{r.CertsDir}, func(configHome, accountConf string) error {
 		var executeErr error
-		result, executeErr = r.execute(cctx, operation, args, p.DNSEnv, configHome)
+		result, executeErr = r.execute(cctx, operation, args, env, configHome, accountConf)
 		return executeErr
 	})
-	return &result, err
+	return &result, safeError(err, env)
 }
 
 func (r *Runner) namedCertificateOperation(ctx context.Context, operation, command string, p *OperationParams) (*OperationResult, error) {
@@ -352,12 +436,13 @@ func (r *Runner) namedCertificateOperation(ctx context.Context, operation, comma
 	cctx, cancel := r.withTimeout(ctx)
 	defer cancel()
 	var result OperationResult
-	err := r.withIsolatedConfig(cctx, operation, p.DNSEnv, []string{r.CertsDir}, func(configHome string) error {
+	env := operationEnv(p)
+	err := r.withIsolatedConfig(cctx, operation, env, []string{r.CertsDir}, func(configHome, accountConf string) error {
 		var executeErr error
-		result, executeErr = r.execute(cctx, operation, args, p.DNSEnv, configHome)
+		result, executeErr = r.execute(cctx, operation, args, env, configHome, accountConf)
 		return executeErr
 	})
-	return &result, err
+	return &result, safeError(err, env)
 }
 
 func (r *Runner) buildIssueArgs(p *IssueParams) []string {
@@ -375,23 +460,34 @@ func (r *Runner) buildIssueArgs(p *IssueParams) []string {
 	case "webroot":
 		args = append(args, "--webroot", p.WebrootPath)
 	}
-	if p.Keylength != "" {
-		args = append(args, "--keylength", p.Keylength)
+	keylength := p.Keylength
+	if keylength == "" {
+		switch p.KeyType {
+		case "ecc":
+			keylength = "ec-256"
+		case "rsa":
+			keylength = "2048"
+		}
+	}
+	if keylength != "" {
+		args = append(args, "--keylength", keylength)
 	}
 	if p.CA != "" {
 		args = append(args, "--server", p.CA)
 	}
+	args = appendACMEOptions(args, p.Staging, p.EABKID, p.EABHMACKey, p.EABKid, p.EABHmacKey)
 	return r.appendHome(args)
 }
 
-func (r *Runner) installCert(ctx context.Context, p *IssueParams, outDir, configHome string) (OperationResult, error) {
+func (r *Runner) installCert(ctx context.Context, p *IssueParams, outDir, configHome, accountConf string) (OperationResult, error) {
 	args := []string{"--install-cert", "-d", p.Domain}
-	if isECC(p.Keylength) {
+	if p.KeyType == "ecc" || (p.KeyType == "" && isECC(p.Keylength)) {
 		args = append(args, "--ecc")
 	}
 	if p.CA != "" {
 		args = append(args, "--server", p.CA)
 	}
+	args = appendACMEOptions(args, p.Staging, "", "", "", "")
 	args = r.appendHome(args)
 	args = append(args,
 		"--cert-file", filepath.Join(outDir, "cert.pem"),
@@ -399,24 +495,58 @@ func (r *Runner) installCert(ctx context.Context, p *IssueParams, outDir, config
 		"--fullchain-file", filepath.Join(outDir, "fullchain.pem"),
 		"--ca-file", filepath.Join(outDir, "ca.pem"),
 	)
-	return r.execute(ctx, "install-cert", args, p.DNSEnv, configHome)
+	return r.execute(ctx, "install-cert", args, issueEnv(p), configHome, accountConf)
 }
 
 func (r *Runner) appendCertificateOptions(args []string, p *OperationParams) []string {
-	if isECC(p.Keylength) {
+	if p.KeyType == "ecc" || (p.KeyType == "" && isECC(p.Keylength)) {
 		args = append(args, "--ecc")
 	}
 	if p.CA != "" {
 		args = append(args, "--server", p.CA)
 	}
+	args = appendACMEOptions(args, p.Staging, "", "", "", "")
 	return r.appendHome(args)
 }
 
-func (r *Runner) appendHome(args []string) []string {
-	if r.Home != "" {
-		args = append(args, "--home", r.Home)
+func appendACMEOptions(args []string, staging bool, eabKID, eabHMACKey, eabKid, eabHmacKey string) []string {
+	if staging {
+		args = append(args, "--staging")
+	}
+	if eabKID == "" {
+		eabKID = eabKid
+	}
+	if eabHMACKey == "" {
+		eabHMACKey = eabHmacKey
+	}
+	if eabKID != "" {
+		args = append(args, "--eab-kid", eabKID)
+	}
+	if eabHMACKey != "" {
+		args = append(args, "--eab-hmac-key", eabHMACKey)
 	}
 	return args
+}
+
+func (r *Runner) appendHome(args []string) []string {
+	if home := r.stateHome(); home != "" {
+		args = append(args, "--home", home)
+	}
+	return args
+}
+
+func (r *Runner) stateHome() string {
+	if r.StateHome != "" {
+		return r.StateHome
+	}
+	return r.Home
+}
+
+func (r *Runner) persistentConfigHome() string {
+	if r.ConfigHome != "" {
+		return r.ConfigHome
+	}
+	return r.stateHome()
 }
 
 func appendConfigHome(args []string, configHome string) []string {
@@ -426,11 +556,22 @@ func appendConfigHome(args []string, configHome string) []string {
 	return args
 }
 
-func (r *Runner) execute(ctx context.Context, operation string, args []string, dnsEnv map[string]string, configHome string) (OperationResult, error) {
+func appendAccountConf(args []string, accountConf string) []string {
+	if accountConf != "" {
+		args = append(args, "--accountconf", accountConf)
+	}
+	return args
+}
+
+func (r *Runner) execute(ctx context.Context, operation string, args []string, dnsEnv map[string]string, configHome string, accountConf ...string) (OperationResult, error) {
 	args = appendConfigHome(args, configHome)
+	if len(accountConf) > 0 {
+		args = appendAccountConf(args, accountConf[0])
+	}
+	redactions := commandRedactions(args, dnsEnv)
 	result := OperationResult{
 		Operation: operation,
-		Args:      append([]string(nil), args...),
+		Args:      redactArgs(args, redactions),
 		ExitCode:  -1,
 	}
 	if err := validateDNSEnv(dnsEnv); err != nil {
@@ -446,19 +587,23 @@ func (r *Runner) execute(ctx context.Context, operation string, args []string, d
 	raw := r.commandExecutor().Execute(ctx, CommandSpec{
 		Path:        r.AcmeShPath,
 		Args:        append([]string(nil), args...),
-		Env:         buildEnv(dnsEnv, r.Home),
+		Env:         buildEnv(dnsEnv, r.stateHome()),
 		OutputLimit: r.outputLimit(),
 	})
 	result.Duration = time.Since(started)
 	result.ExitCode = raw.ExitCode
-	result.Stdout, result.StdoutTruncated = redactAndLimit(raw.Stdout, dnsEnv, r.outputLimit())
-	result.Stderr, result.StderrTruncated = redactAndLimit(raw.Stderr, dnsEnv, r.outputLimit())
+	result.Stdout, result.StdoutTruncated = redactAndLimit(raw.Stdout, redactions, r.outputLimit())
+	result.Stderr, result.StderrTruncated = redactAndLimit(raw.Stderr, redactions, r.outputLimit())
 	result.StdoutTruncated = result.StdoutTruncated || raw.StdoutTruncated
 	result.StderrTruncated = result.StderrTruncated || raw.StderrTruncated
 
 	if err := ctx.Err(); err != nil {
 		result.Status = contextStatus(err)
 		return result, contextOperationError(operation, err)
+	}
+	if errors.Is(raw.Err, context.DeadlineExceeded) || errors.Is(raw.Err, context.Canceled) {
+		result.Status = contextStatus(raw.Err)
+		return result, contextOperationError(operation, raw.Err)
 	}
 	if raw.ExitCode == 0 && raw.Err == nil {
 		result.Status = OperationSucceeded
@@ -529,6 +674,13 @@ func validateIssueParams(p *IssueParams) error {
 	if p == nil {
 		return errors.New("参数不能为空")
 	}
+	if err := validateIssueCommon(p); err != nil {
+		return err
+	}
+	return validateChallengeParams(p)
+}
+
+func validateIssueCommon(p *IssueParams) error {
 	if err := validateDomain(p.Domain); err != nil {
 		return err
 	}
@@ -540,9 +692,28 @@ func validateIssueParams(p *IssueParams) error {
 	if err := validateKeylength(p.Keylength); err != nil {
 		return err
 	}
-	if err := validateDNSEnv(p.DNSEnv); err != nil {
+	if err := validateKeyType(p.KeyType, p.Keylength); err != nil {
+		return err
+	}
+	if err := validateCA(p.CA); err != nil {
+		return err
+	}
+	if err := validateProfile(p.Profile); err != nil {
+		return err
+	}
+	if err := validateEAB(p.EABKID, p.EABHMACKey, p.EABKid, p.EABHmacKey); err != nil {
+		return err
+	}
+	if err := validateStagingDir(p.StagingDir); err != nil {
+		return err
+	}
+	if err := validateDNSEnv(issueEnv(p)); err != nil {
 		return fmt.Errorf("DNS 环境变量无效: %w", err)
 	}
+	return nil
+}
+
+func validateChallengeParams(p *IssueParams) error {
 	switch p.ChallengeMode {
 	case "dns_api":
 		if !dnsProviderName.MatchString(p.DNSProvider) {
@@ -569,7 +740,19 @@ func validateOperationParams(p *OperationParams) error {
 	if err := validateKeylength(p.Keylength); err != nil {
 		return err
 	}
-	if err := validateDNSEnv(p.DNSEnv); err != nil {
+	if err := validateKeyType(p.KeyType, p.Keylength); err != nil {
+		return err
+	}
+	if err := validateCA(p.CA); err != nil {
+		return err
+	}
+	if err := validateProfile(p.Profile); err != nil {
+		return err
+	}
+	if err := validateEAB(p.EABKID, p.EABHMACKey, p.EABKid, p.EABHmacKey); err != nil {
+		return err
+	}
+	if err := validateDNSEnv(operationEnv(p)); err != nil {
 		return fmt.Errorf("DNS 环境变量无效: %w", err)
 	}
 	return nil
@@ -579,16 +762,7 @@ func validateRenewInstallParams(p *IssueParams) error {
 	if p == nil {
 		return errors.New("参数不能为空")
 	}
-	if err := validateDomain(p.Domain); err != nil {
-		return err
-	}
-	if err := validateKeylength(p.Keylength); err != nil {
-		return err
-	}
-	if err := validateDNSEnv(p.DNSEnv); err != nil {
-		return fmt.Errorf("DNS 环境变量无效: %w", err)
-	}
-	return nil
+	return validateIssueCommon(p)
 }
 
 func validateDomain(domain string) error {
@@ -604,6 +778,70 @@ func validateKeylength(keylength string) error {
 	}
 	if _, ok := validKeylength[keylength]; !ok {
 		return errors.New("不支持的密钥算法")
+	}
+	return nil
+}
+
+func validateKeyType(keyType, keylength string) error {
+	if keyType != "" && keyType != "ecc" && keyType != "rsa" {
+		return errors.New("密钥类型必须是 ecc 或 rsa")
+	}
+	if keyType == "ecc" && keylength != "" && !isECC(keylength) {
+		return errors.New("ecc 密钥类型与 RSA keylength 不匹配")
+	}
+	if keyType == "rsa" && isECC(keylength) {
+		return errors.New("rsa 密钥类型与 ECC keylength 不匹配")
+	}
+	return nil
+}
+
+func validateCA(ca string) error {
+	if ca == "" {
+		return nil
+	}
+	if caName.MatchString(ca) {
+		return nil
+	}
+	u, err := url.Parse(ca)
+	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return errors.New("CA 必须是小写标识符或 HTTPS URL")
+	}
+	return nil
+}
+
+func validateProfile(profile string) error {
+	if profile != "" && !profileName.MatchString(profile) {
+		return errors.New("DNS profile 格式无效")
+	}
+	return nil
+}
+
+func validateEAB(kid, hmac, compatKid, compatHMAC string) error {
+	if kid != "" && compatKid != "" && kid != compatKid {
+		return errors.New("EAB KID 参数重复且不一致")
+	}
+	if hmac != "" && compatHMAC != "" && hmac != compatHMAC {
+		return errors.New("EAB HMAC key 参数重复且不一致")
+	}
+	if kid == "" {
+		kid = compatKid
+	}
+	if hmac == "" {
+		hmac = compatHMAC
+	}
+	if (kid == "") != (hmac == "") {
+		return errors.New("EAB KID 和 HMAC key 必须同时提供")
+	}
+	if len(kid) > 1024 || len(hmac) > 4096 || strings.TrimSpace(kid) != kid || strings.TrimSpace(hmac) != hmac ||
+		strings.ContainsAny(kid, "\x00\r\n\t") || strings.ContainsAny(hmac, "\x00\r\n\t") {
+		return errors.New("EAB 参数格式无效")
+	}
+	return nil
+}
+
+func validateStagingDir(dir string) error {
+	if strings.ContainsRune(dir, '\x00') {
+		return errors.New("staging 目录格式无效")
 	}
 	return nil
 }
@@ -721,6 +959,115 @@ func redactAndLimit(output string, dnsEnv map[string]string, limit int) (string,
 	return output[:limit], true
 }
 
+func redactArgs(args []string, dnsEnv map[string]string) []string {
+	redacted := append([]string(nil), args...)
+	secrets := dnsCanaries(dnsEnv)
+	for i, arg := range redacted {
+		for _, secret := range secrets {
+			if secret != "" {
+				redacted[i] = strings.ReplaceAll(redacted[i], secret, "***")
+			}
+		}
+		if (arg == "--eab-kid" || arg == "--eab-hmac-key") && i+1 < len(redacted) {
+			redacted[i+1] = "***"
+		}
+	}
+	return redacted
+}
+
+func commandRedactions(args []string, dnsEnv map[string]string) map[string]string {
+	redactions := mergeEnv(dnsEnv, nil)
+	if redactions == nil {
+		redactions = make(map[string]string)
+	}
+	for i, arg := range args {
+		if (arg == "--eab-kid" || arg == "--eab-hmac-key") && i+1 < len(args) {
+			redactions[fmt.Sprintf("EAB_%d", i)] = args[i+1]
+		}
+	}
+	return redactions
+}
+
+func issueEnv(p *IssueParams) map[string]string {
+	return mergeEnv(p.DNSEnv, p.Env)
+}
+
+func operationEnv(p *OperationParams) map[string]string {
+	return mergeEnv(p.DNSEnv, p.Env)
+}
+
+func mergeEnv(legacy, current map[string]string) map[string]string {
+	if len(legacy) == 0 && len(current) == 0 {
+		return nil
+	}
+	merged := make(map[string]string, len(legacy)+len(current))
+	for name, value := range legacy {
+		merged[name] = value
+	}
+	for name, value := range current {
+		merged[name] = value
+	}
+	return merged
+}
+
+func (r *Runner) outputDir(p *IssueParams) (string, string, error) {
+	if p.StagingDir != "" {
+		if err := os.MkdirAll(p.StagingDir, 0o755); err != nil {
+			return "", "", fmt.Errorf("创建 staging 目录失败: %w", err)
+		}
+		return p.StagingDir, p.StagingDir, nil
+	}
+	certsDir := r.CertsDir
+	if p.CertsDir != "" {
+		certsDir = p.CertsDir
+	}
+	if certsDir == "" {
+		return "", "", errors.New("证书目录不能为空")
+	}
+	if err := os.MkdirAll(certsDir, 0o755); err != nil {
+		return "", "", fmt.Errorf("创建证书目录失败: %w", err)
+	}
+	outDir := filepath.Join(certsDir, p.Domain)
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return "", "", fmt.Errorf("创建域名证书目录失败: %w", err)
+	}
+	return outDir, certsDir, nil
+}
+
+func (r *Runner) hasDomainState(domain, keyType, keylength string) bool {
+	homes := []string{r.persistentConfigHome(), r.stateHome()}
+	if homes[0] == "" && homes[1] == "" {
+		return false
+	}
+	seen := make(map[string]struct{}, len(homes))
+	for _, home := range homes {
+		if home == "" {
+			continue
+		}
+		if _, ok := seen[home]; ok {
+			continue
+		}
+		seen[home] = struct{}{}
+		bases := []string{filepath.Join(home, domain), filepath.Join(home, domain+"_ecc")}
+		if keyType == "rsa" || (keyType == "" && !isECC(keylength) && keylength != "") {
+			bases = bases[:1]
+		}
+		for _, base := range bases {
+			candidates := []string{
+				base + ".conf",
+				filepath.Join(base, domain+".conf"),
+				filepath.Join(base, domain+"_ecc.conf"),
+			}
+			for _, candidate := range candidates {
+				if info, err := os.Stat(candidate); err == nil && info.Mode().IsRegular() {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 func readNotAfter(dir string) (time.Time, error) {
 	full := filepath.Join(dir, "fullchain.pem")
 	data, err := os.ReadFile(full)
@@ -770,8 +1117,8 @@ func (r *Runner) AutoUpgrade(ctx context.Context) error {
 	cctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	var err error
-	err = r.withIsolatedConfig(cctx, "upgrade", nil, nil, func(configHome string) error {
-		_, executeErr := r.execute(cctx, "upgrade", r.appendHome([]string{"--upgrade", "--auto-upgrade"}), nil, configHome)
+	err = r.withIsolatedConfig(cctx, "upgrade", nil, nil, func(configHome, accountConf string) error {
+		_, executeErr := r.execute(cctx, "upgrade", r.appendHome([]string{"--upgrade", "--auto-upgrade"}), nil, configHome, accountConf)
 		return executeErr
 	})
 	return err
@@ -782,14 +1129,17 @@ func (r *Runner) SetDefaultCA(ctx context.Context, ca string) error {
 	if ca == "" {
 		return nil
 	}
+	if err := validateCA(ca); err != nil {
+		return err
+	}
 	if err := r.validateReady(); err != nil {
 		return err
 	}
 	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	var err error
-	err = r.withIsolatedConfig(cctx, "set-default-ca", nil, nil, func(configHome string) error {
-		_, executeErr := r.execute(cctx, "set-default-ca", r.appendHome([]string{"--set-default-ca", "--server", ca}), nil, configHome)
+	err = r.withIsolatedConfig(cctx, "set-default-ca", nil, nil, func(configHome, accountConf string) error {
+		_, executeErr := r.execute(cctx, "set-default-ca", r.appendHome([]string{"--set-default-ca", "--server", ca}), nil, configHome, accountConf)
 		return executeErr
 	})
 	return err
@@ -797,15 +1147,17 @@ func (r *Runner) SetDefaultCA(ctx context.Context, ca string) error {
 
 // AccountRegistered 检查是否已注册 ACME 账户（粗略检查 home 目录下有账号文件）。
 func (r *Runner) AccountRegistered() bool {
-	if r.Home == "" {
-		return false
+	for _, home := range []string{r.persistentConfigHome(), r.stateHome()} {
+		if home == "" {
+			continue
+		}
+		// acme.sh 账户文件在 ca/<domain>:/ 目录下。
+		entries, err := os.ReadDir(filepath.Join(home, "ca"))
+		if err == nil && len(entries) > 0 {
+			return true
+		}
 	}
-	// acme.sh 账户文件在 ca/<domain>:/ 目录下。
-	entries, err := os.ReadDir(filepath.Join(r.Home, "ca"))
-	if err != nil {
-		return false
-	}
-	return len(entries) > 0
+	return false
 }
 
 // RegisterAccount 注册 ACME 账户。
@@ -819,9 +1171,9 @@ func (r *Runner) RegisterAccount(ctx context.Context, email string) error {
 	cctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 	var result OperationResult
-	err := r.withIsolatedConfig(cctx, "register-account", nil, nil, func(configHome string) error {
+	err := r.withIsolatedConfig(cctx, "register-account", nil, nil, func(configHome, accountConf string) error {
 		var executeErr error
-		result, executeErr = r.execute(cctx, "register-account", r.appendHome([]string{"--register-account", "-m", email}), nil, configHome)
+		result, executeErr = r.execute(cctx, "register-account", r.appendHome([]string{"--register-account", "-m", email}), nil, configHome, accountConf)
 		return executeErr
 	})
 	if err != nil && strings.Contains(result.Stdout+"\n"+result.Stderr, "already") {

@@ -35,18 +35,39 @@ func (f *fakeExecutor) Execute(ctx context.Context, spec CommandSpec) CommandRes
 	return result
 }
 
-// splitConfigHome 取出命令参数中的 --config-home 值，返回该值和剩余参数。
-func splitConfigHome(t *testing.T, args []string) (string, []string) {
+// splitIsolationArgs 取出持久 config-home 和临时 accountconf，返回二者及剩余参数。
+func splitIsolationArgs(t *testing.T, args []string) (string, string, []string) {
 	t.Helper()
-	for i, arg := range args {
-		if arg == "--config-home" && i+1 < len(args) {
-			rest := append([]string(nil), args[:i]...)
-			rest = append(rest, args[i+2:]...)
-			return args[i+1], rest
+	var configHome, accountConf string
+	rest := make([]string, 0, len(args)-4)
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--config-home":
+			if i+1 >= len(args) {
+				t.Fatalf("--config-home 缺少参数: %v", args)
+			}
+			configHome = args[i+1]
+			i++
+		case "--accountconf":
+			if i+1 >= len(args) {
+				t.Fatalf("--accountconf 缺少参数: %v", args)
+			}
+			accountConf = args[i+1]
+			i++
+		default:
+			rest = append(rest, args[i])
 		}
 	}
-	t.Fatalf("命令缺少 --config-home: %v", args)
-	return "", nil
+	if configHome == "" || accountConf == "" {
+		t.Fatalf("命令缺少隔离参数: %v", args)
+	}
+	return configHome, accountConf, rest
+}
+
+func splitConfigHome(t *testing.T, args []string) (string, []string) {
+	t.Helper()
+	configHome, _, rest := splitIsolationArgs(t, args)
+	return configHome, rest
 }
 
 func assertArgs(t *testing.T, got, want []string) {
@@ -65,13 +86,41 @@ func assertNoFlag(t *testing.T, args []string, flag string) {
 	}
 }
 
-func assertConfigHomeRemoved(t *testing.T, dir string) {
-	t.Helper()
-	if dir == "" {
-		t.Fatal("config home 为空")
+func containsArg(args []string, want string) bool {
+	for _, arg := range args {
+		if arg == want {
+			return true
+		}
 	}
-	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("临时 config home 未被删除: %s", dir)
+	return false
+}
+
+func argValue(args []string, flag string) string {
+	for i, arg := range args {
+		if arg == flag && i+1 < len(args) {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
+func envValue(env []string, name string) string {
+	prefix := name + "="
+	for _, entry := range env {
+		if strings.HasPrefix(entry, prefix) {
+			return strings.TrimPrefix(entry, prefix)
+		}
+	}
+	return ""
+}
+
+func assertPathRemoved(t *testing.T, path string) {
+	t.Helper()
+	if path == "" {
+		t.Fatal("待检查路径为空")
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("临时路径未被删除: %s", path)
 	}
 }
 
@@ -142,10 +191,13 @@ func TestIssueECCUsesCallerCertsDirAndInstallECC(t *testing.T) {
 	}
 
 	// issue 与 install 必须共享同一个临时 config home。
-	issueHome, issueArgs := splitConfigHome(t, fake.commands[0].Args)
-	installHome, installArgs := splitConfigHome(t, fake.commands[1].Args)
+	issueHome, issueAccountConf, issueArgs := splitIsolationArgs(t, fake.commands[0].Args)
+	installHome, installAccountConf, installArgs := splitIsolationArgs(t, fake.commands[1].Args)
 	if issueHome != installHome {
 		t.Fatalf("issue/install config home 不一致: %q vs %q", issueHome, installHome)
+	}
+	if issueAccountConf != installAccountConf {
+		t.Fatalf("issue/install accountconf 不一致: %q vs %q", issueAccountConf, installAccountConf)
 	}
 	assertArgs(t, issueArgs, []string{
 		"--issue", "-d", "example.com", "--dns", "dns_cf", "--keylength", "ec-256", "--home", "/acme-home",
@@ -157,8 +209,8 @@ func TestIssueECCUsesCallerCertsDirAndInstallECC(t *testing.T) {
 		"--fullchain-file", filepath.Join(certsDir, "example.com", "fullchain.pem"),
 		"--ca-file", filepath.Join(certsDir, "example.com", "ca.pem"),
 	})
-	// 默认隔离模式下，操作结束后临时 config home 必须被删除。
-	assertConfigHomeRemoved(t, issueHome)
+	// 持久 config-home 保留，临时 accountconf 所在目录必须删除。
+	assertPathRemoved(t, filepath.Dir(issueAccountConf))
 	if result.Duration <= 0 {
 		t.Fatalf("Duration = %s，期望大于零", result.Duration)
 	}
@@ -176,16 +228,19 @@ func TestRenewAndReissueRSA(t *testing.T) {
 		t.Fatalf("Reissue() error = %v", err)
 	}
 
-	renewHome, renewArgs := splitConfigHome(t, fake.commands[0].Args)
-	reissueHome, reissueArgs := splitConfigHome(t, fake.commands[1].Args)
+	renewHome, renewAccountConf, renewArgs := splitIsolationArgs(t, fake.commands[0].Args)
+	reissueHome, reissueAccountConf, reissueArgs := splitIsolationArgs(t, fake.commands[1].Args)
 	assertArgs(t, renewArgs, []string{"--renew", "-d", "example.com", "--server", "letsencrypt", "--home", "/acme-home"})
 	assertArgs(t, reissueArgs, []string{"--renew", "-d", "example.com", "--force", "--server", "letsencrypt", "--home", "/acme-home"})
-	// 每次操作使用独立的临时 config home，且结束后删除。
-	if renewHome == reissueHome {
-		t.Fatalf("连续操作不应复用同一临时 config home: %q", renewHome)
+	// 连续操作复用持久 config-home，但使用不同的临时 accountconf。
+	if renewHome != reissueHome {
+		t.Fatalf("连续操作应复用 config-home: %q vs %q", renewHome, reissueHome)
 	}
-	assertConfigHomeRemoved(t, renewHome)
-	assertConfigHomeRemoved(t, reissueHome)
+	if renewAccountConf == reissueAccountConf {
+		t.Fatalf("连续操作不应复用 accountconf: %q", renewAccountConf)
+	}
+	assertPathRemoved(t, filepath.Dir(renewAccountConf))
+	assertPathRemoved(t, filepath.Dir(reissueAccountConf))
 	for _, args := range [][]string{renewArgs, reissueArgs} {
 		assertNoFlag(t, args, "--ecc")
 	}
@@ -194,6 +249,10 @@ func TestRenewAndReissueRSA(t *testing.T) {
 func TestExplicitConfigHomeIsReusedAndKept(t *testing.T) {
 	fake := &fakeExecutor{results: []CommandResult{{ExitCode: 0}}}
 	configHome := t.TempDir()
+	stateFile := filepath.Join(configHome, "account-state.conf")
+	if err := os.WriteFile(stateFile, []byte("ACCOUNT_EMAIL='ops@example.com'"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	runner := &Runner{AcmeShPath: "acme.sh", Home: "/acme-home", ConfigHome: configHome, Executor: fake}
 
 	if _, err := runner.Renew(context.Background(), &OperationParams{Domain: "example.com", Keylength: "2048"}); err != nil {
@@ -205,6 +264,173 @@ func TestExplicitConfigHomeIsReusedAndKept(t *testing.T) {
 	}
 	if _, err := os.Stat(configHome); err != nil {
 		t.Fatalf("显式 ConfigHome 不应被删除: %v", err)
+	}
+	if _, err := os.Stat(stateFile); err != nil {
+		t.Fatalf("持久 config-home 中的账户状态不应被删除: %v", err)
+	}
+}
+
+func TestRegisterAccountPersistsStateWithoutTemporaryAccountConf(t *testing.T) {
+	configHome := t.TempDir()
+	fake := &fakeExecutor{}
+	fake.executeFn = func(_ context.Context, spec CommandSpec) CommandResult {
+		if containsArg(spec.Args, "--accountconf") {
+			t.Fatalf("账户注册不应使用临时 accountconf: %v", spec.Args)
+		}
+		if argValue(spec.Args, "--config-home") != configHome {
+			t.Fatalf("账户注册未使用持久 config-home: %v", spec.Args)
+		}
+		accountDir := filepath.Join(configHome, "ca", "acme.example.test")
+		if err := os.MkdirAll(accountDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(accountDir, "account.key"), []byte("test-key"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return CommandResult{ExitCode: 0}
+	}
+	runner := &Runner{AcmeShPath: "acme.sh", StateHome: t.TempDir(), ConfigHome: configHome, Executor: fake}
+	if err := runner.RegisterAccount(context.Background(), "ops@example.com"); err != nil {
+		t.Fatalf("RegisterAccount() error = %v", err)
+	}
+	if !runner.AccountRegistered() {
+		t.Fatal("持久账户状态未被 AccountRegistered 识别")
+	}
+}
+
+func TestIssueOrRenewReusesStateAndIsolatesAccountConf(t *testing.T) {
+	configHome := t.TempDir()
+	stagingDir := t.TempDir()
+	canary := "cf-accountconf-canary-8c41"
+	fake := &fakeExecutor{}
+	fake.executeFn = func(_ context.Context, spec CommandSpec) CommandResult {
+		accountConf := argValue(spec.Args, "--accountconf")
+		if accountConf == "" {
+			t.Fatalf("命令缺少 --accountconf: %v", spec.Args)
+		}
+		if err := os.WriteFile(accountConf, []byte("SAVED_CF_Token='"+canary+"'"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if containsArg(spec.Args, "--issue") {
+			domainDir := filepath.Join(configHome, "example.com")
+			if err := os.MkdirAll(domainDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(domainDir, "example.com.conf"), []byte("Le_Domain='example.com'"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return CommandResult{ExitCode: 0}
+	}
+	runner := &Runner{
+		AcmeShPath: "acme.sh",
+		StateHome:  t.TempDir(),
+		ConfigHome: configHome,
+		Executor:   fake,
+	}
+	params := &IssueParams{
+		Domain:        "example.com",
+		ChallengeMode: "dns_api",
+		DNSProvider:   "dns_cf",
+		Keylength:     "2048",
+		StagingDir:    stagingDir,
+		Env:           map[string]string{"CF_Token": canary},
+		Profile:       "production-a",
+	}
+
+	if _, err := runner.IssueOrRenew(context.Background(), params); err != nil {
+		t.Fatalf("首次 IssueOrRenew() error = %v", err)
+	}
+	if _, err := runner.IssueOrRenew(context.Background(), params); err != nil {
+		t.Fatalf("第二次 IssueOrRenew() error = %v", err)
+	}
+	if _, err := runner.IssueOrRenew(context.Background(), params, true); err != nil {
+		t.Fatalf("强制 IssueOrRenew() error = %v", err)
+	}
+	if len(fake.commands) != 6 {
+		t.Fatalf("命令调用次数 = %d，期望 issue/install、renew/install、force renew/install", len(fake.commands))
+	}
+	assertNoFlag(t, fake.commands[0].Args, "--renew")
+	if !containsArg(fake.commands[0].Args, "--issue") {
+		t.Fatalf("首次调用应执行 issue: %v", fake.commands[0].Args)
+	}
+	if !containsArg(fake.commands[2].Args, "--renew") {
+		t.Fatalf("第二次调用应执行 renew: %v", fake.commands[2].Args)
+	}
+	assertNoFlag(t, fake.commands[2].Args, "--force")
+	if !containsArg(fake.commands[4].Args, "--force") {
+		t.Fatalf("第三次调用应强制 renew: %v", fake.commands[4].Args)
+	}
+
+	var previousAccountConf string
+	for i := 0; i < len(fake.commands); i += 2 {
+		issueConfig, issueAccount, _ := splitIsolationArgs(t, fake.commands[i].Args)
+		installConfig, installAccount, _ := splitIsolationArgs(t, fake.commands[i+1].Args)
+		if issueConfig != configHome || installConfig != configHome {
+			t.Fatalf("未复用持久 config-home: %q, %q", issueConfig, installConfig)
+		}
+		if issueAccount != installAccount {
+			t.Fatalf("同一流程未共享 accountconf: %q, %q", issueAccount, installAccount)
+		}
+		if issueAccount == previousAccountConf {
+			t.Fatalf("连续流程复用了临时 accountconf: %q", issueAccount)
+		}
+		previousAccountConf = issueAccount
+		assertPathRemoved(t, filepath.Dir(issueAccount))
+	}
+	if _, err := os.Stat(filepath.Join(configHome, "example.com", "example.com.conf")); err != nil {
+		t.Fatalf("domain 状态未持久保留: %v", err)
+	}
+	if err := scanPersistentDirs(context.Background(), []string{configHome}, params.Env); err != nil {
+		t.Fatalf("持久 config-home 不应包含 DNS canary: %v", err)
+	}
+}
+
+func TestIssueProfileEnvStagingAndEAB(t *testing.T) {
+	secret := "profile-token-canary-31ef"
+	fake := &fakeExecutor{results: []CommandResult{{ExitCode: 0}, {ExitCode: 0}}}
+	stagingDir := filepath.Join(t.TempDir(), "staging")
+	runner := &Runner{
+		AcmeShPath: "acme.sh",
+		StateHome:  t.TempDir(),
+		ConfigHome: t.TempDir(),
+		Executor:   fake,
+	}
+	result, err := runner.Issue(context.Background(), &IssueParams{
+		Domain:        "example.com",
+		SAN:           []string{"www.example.com"},
+		CA:            "https://acme.example.test/directory",
+		ChallengeMode: "dns_api",
+		DNSProvider:   "dns_cf",
+		Profile:       "account-a",
+		Env:           map[string]string{"CF_Token": secret},
+		KeyType:       "ecc",
+		Staging:       true,
+		StagingDir:    stagingDir,
+		EABKID:        "kid-123",
+		EABHMACKey:    "hmac-secret-value",
+	})
+	if err != nil {
+		t.Fatalf("Issue() error = %v", err)
+	}
+	if result.OutDir != stagingDir {
+		t.Fatalf("OutDir = %q，期望 %q", result.OutDir, stagingDir)
+	}
+	_, _, issueArgs := splitIsolationArgs(t, fake.commands[0].Args)
+	assertArgs(t, issueArgs, []string{
+		"--issue", "-d", "example.com", "-d", "www.example.com", "--dns", "dns_cf",
+		"--keylength", "ec-256", "--server", "https://acme.example.test/directory", "--staging",
+		"--eab-kid", "kid-123", "--eab-hmac-key", "hmac-secret-value", "--home", runner.StateHome,
+	})
+	if envValue(fake.commands[0].Env, "CF_Token") != secret {
+		t.Fatal("Env 中的 DNS 凭据未注入命令环境")
+	}
+	if strings.Contains(strings.Join(result.Issue.Args, " "), "hmac-secret-value") || strings.Contains(strings.Join(result.Issue.Args, " "), "kid-123") {
+		t.Fatalf("结构化命令参数泄露 EAB 凭据: %v", result.Issue.Args)
+	}
+	_, _, installArgs := splitIsolationArgs(t, fake.commands[1].Args)
+	if !containsArg(installArgs, "--ecc") || !containsArg(installArgs, "--staging") {
+		t.Fatalf("ECC/staging 安装参数缺失: %v", installArgs)
 	}
 }
 
@@ -224,6 +450,22 @@ func TestInvalidParametersDoNotExecute(t *testing.T) {
 		{
 			name:   "缺少DNS标识符",
 			params: &IssueParams{Domain: "example.com", ChallengeMode: "dns_api", Keylength: "2048"},
+		},
+		{
+			name:   "非法profile",
+			params: &IssueParams{Domain: "example.com", ChallengeMode: "standalone", Keylength: "2048", Profile: "../prod"},
+		},
+		{
+			name:   "EAB参数不完整",
+			params: &IssueParams{Domain: "example.com", ChallengeMode: "standalone", Keylength: "2048", EABKID: "kid-only"},
+		},
+		{
+			name:   "密钥类型冲突",
+			params: &IssueParams{Domain: "example.com", ChallengeMode: "standalone", KeyType: "rsa", Keylength: "ec-256"},
+		},
+		{
+			name:   "非法CA",
+			params: &IssueParams{Domain: "example.com", ChallengeMode: "standalone", Keylength: "2048", CA: "http://acme.example.test/directory"},
 		},
 	}
 	for _, tc := range cases {
@@ -359,8 +601,8 @@ func TestRenewAndInstallECCForce(t *testing.T) {
 	}
 
 	outDir := filepath.Join(certsDir, "example.com")
-	renewHome, renewArgs := splitConfigHome(t, fake.commands[0].Args)
-	installHome, installArgs := splitConfigHome(t, fake.commands[1].Args)
+	renewHome, renewAccountConf, renewArgs := splitIsolationArgs(t, fake.commands[0].Args)
+	installHome, installAccountConf, installArgs := splitIsolationArgs(t, fake.commands[1].Args)
 	assertArgs(t, renewArgs, []string{
 		"--renew", "-d", "example.com", "--force", "--ecc", "--server", "letsencrypt", "--home", home,
 	})
@@ -375,7 +617,10 @@ func TestRenewAndInstallECCForce(t *testing.T) {
 	if renewHome != installHome {
 		t.Fatalf("renew/install config home 不一致: %q vs %q", renewHome, installHome)
 	}
-	assertConfigHomeRemoved(t, renewHome)
+	if renewAccountConf != installAccountConf {
+		t.Fatalf("renew/install accountconf 不一致: %q vs %q", renewAccountConf, installAccountConf)
+	}
+	assertPathRemoved(t, filepath.Dir(renewAccountConf))
 
 	if _, err := os.Stat(filepath.Join(outDir, "time.log")); err != nil {
 		t.Fatalf("成功安装后应写入 time.log: %v", err)
@@ -410,14 +655,17 @@ func TestRenewAndInstallSkippedStillInstalls(t *testing.T) {
 	if result.Install.Operation != "install-cert" || result.Install.Status != OperationSucceeded {
 		t.Fatalf("install 结果异常: %#v", result.Install)
 	}
-	renewHome, renewArgs := splitConfigHome(t, fake.commands[0].Args)
-	installHome, installArgs := splitConfigHome(t, fake.commands[1].Args)
+	renewHome, renewAccountConf, renewArgs := splitIsolationArgs(t, fake.commands[0].Args)
+	installHome, installAccountConf, installArgs := splitIsolationArgs(t, fake.commands[1].Args)
 	if renewHome != installHome {
 		t.Fatal("skipped 路径也应共享 config home")
 	}
+	if renewAccountConf != installAccountConf {
+		t.Fatal("skipped 路径也应共享 accountconf")
+	}
 	assertNoFlag(t, renewArgs, "--force")
 	assertNoFlag(t, installArgs, "--ecc")
-	assertConfigHomeRemoved(t, renewHome)
+	assertPathRemoved(t, filepath.Dir(renewAccountConf))
 }
 
 func TestRenewAndInstallManualPendingSkipsInstall(t *testing.T) {
@@ -561,5 +809,30 @@ func TestSafeErrorRedactsAndPreservesUnwrap(t *testing.T) {
 	var opErr *OperationError
 	if !errors.As(wrapped, &opErr) {
 		t.Fatalf("safeError 应保留错误链: %v", wrapped)
+	}
+}
+
+func TestOSCommandExecutorCancelsProcessGroup(t *testing.T) {
+	tempDir := t.TempDir()
+	script := filepath.Join(tempDir, "fake-acme.sh")
+	marker := filepath.Join(tempDir, "child-finished")
+	content := "#!/bin/sh\n(sleep 0.30; printf child > \"$1\") &\nsleep 5\n"
+	if err := os.WriteFile(script, []byte(content), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	result := (OSCommandExecutor{}).Execute(ctx, CommandSpec{
+		Path:        script,
+		Args:        []string{marker},
+		Env:         os.Environ(),
+		OutputLimit: 1024,
+	})
+	if !errors.Is(result.Err, context.DeadlineExceeded) || result.ExitCode != -1 {
+		t.Fatalf("执行结果 = %#v，期望 deadline exceeded", result)
+	}
+	time.Sleep(400 * time.Millisecond)
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("取消后子进程仍在运行，marker 状态: %v", err)
 	}
 }
