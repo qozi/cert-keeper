@@ -160,18 +160,22 @@ func TestE2EHappyPath(t *testing.T) {
 	}
 	code, body = env.signedDo(t, tokenID, secret, http.MethodPost, reconcilePath,
 		[]byte(`{"idempotency_key":"happy-key-1","operation":"client","reason":"幂等重放"}`))
-	if code != http.StatusOK {
-		t.Fatalf("幂等重放状态码 = %d，期望 200: %s", code, body)
+	if code != http.StatusAccepted {
+		t.Fatalf("幂等重放状态码 = %d，期望 202: %s", code, body)
 	}
-	var replay certproto.ReconcileResponse
-	if err := json.Unmarshal(body, &replay); err != nil {
+	var accepted certproto.JobAcceptedResponse
+	if err := json.Unmarshal(body, &accepted); err != nil {
 		t.Fatal(err)
 	}
-	if !replay.Success {
-		t.Fatalf("幂等重放未成功: %+v", replay)
+	if err := accepted.Validate(); err != nil {
+		t.Fatal(err)
 	}
-	if replay.Changed && replay.Job.ID != genRecord.JobID {
-		t.Fatalf("幂等重放触发了新签发且未复用原任务: changed=%t job=%q", replay.Changed, replay.Job.ID)
+	replayJob := env.waitJob(t, tokenID, secret, accepted.Location)
+	if replayJob.State != certproto.JobStateSucceeded {
+		t.Fatalf("幂等重放任务未成功: %+v", replayJob)
+	}
+	if replayJob.ID != genRecord.JobID {
+		t.Fatalf("幂等重放未复用原任务: job=%q", replayJob.ID)
 	}
 	if got := env.issuer.calls.Load(); got != 1 {
 		t.Fatalf("幂等重放后签发次数 = %d，期望仍为 1", got)

@@ -3,6 +3,7 @@
 package e2e
 
 import (
+	"encoding/json"
 	"net/http"
 	"testing"
 
@@ -56,7 +57,7 @@ func TestE2EDenyByDefault(t *testing.T) {
 		{"无 grant status", tokenID, secret, http.MethodGet, statusPath, nil},
 		{"无 grant 下载 key.pem", tokenID, secret, http.MethodGet, keyPath, nil},
 		{"无 grant 读取 manifest", tokenID, secret, http.MethodGet, manifestPath, nil},
-		{"无 grant 部署回报", tokenID, secret, http.MethodPost, deployPath, []byte(`{"target":"node-1","state":"succeeded","success":true}`)},
+		{"无 grant 部署回报", tokenID, secret, http.MethodPost, deployPath, []byte(`{"domain":"deny.example.test","generation":"g-deny","revision":1,"target":"node-1","state":"succeeded","success":true}`)},
 		{"admin 无 grant status", adminID, adminSecret, http.MethodGet, statusPath, nil},
 		{"admin 无 grant reconcile", adminID, adminSecret, http.MethodPost, reconcilePath, []byte(`{"idempotency_key":"deny-key-2"}`)},
 	}
@@ -83,7 +84,7 @@ func TestE2EBodyTamper(t *testing.T) {
 
 	const tokenID = "client-tamper"
 	secret := env.createToken(t, tokenID, false)
-	env.grant(t, tokenID, domain, "apply")
+	env.grant(t, tokenID, domain, "apply", "status")
 
 	reconcilePath, err := certproto.ReconcileURLPath(domain)
 	if err != nil {
@@ -94,8 +95,19 @@ func TestE2EBodyTamper(t *testing.T) {
 	originalBody := []byte(`{"idempotency_key":"tamper-key-1"}`)
 	header := signHeaders(t, tokenID, secret, http.MethodPost, reconcilePath, originalBody)
 	code, body := env.doRaw(t, http.MethodPost, reconcilePath, originalBody, header)
-	if code != http.StatusOK {
-		t.Fatalf("合法签名请求状态码 = %d，期望 200: %s", code, body)
+	if code != http.StatusAccepted {
+		t.Fatalf("合法签名请求状态码 = %d，期望 202: %s", code, body)
+	}
+	var accepted certproto.JobAcceptedResponse
+	if err := json.Unmarshal(body, &accepted); err != nil {
+		t.Fatal(err)
+	}
+	if err := accepted.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	job := env.waitJob(t, tokenID, secret, accepted.Location)
+	if job.State != certproto.JobStateSucceeded {
+		t.Fatalf("合法请求任务状态 = %q，期望 succeeded", job.State)
 	}
 
 	// 篡改组：保持原 X-CK-BodyHash 与签名不变，仅替换请求体，必须 401。

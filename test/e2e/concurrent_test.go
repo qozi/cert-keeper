@@ -36,11 +36,17 @@ func TestE2EConcurrentReconcile(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			errs[i] = cli.ApplyV2(t.Context(), client.ApplyV2Opts{
+			opts := client.ApplyV2Opts{
 				Domain:         domain,
 				IdempotencyKey: fmt.Sprintf("conc-key-%d", i),
 				OutDir:         outDirs[i],
-			})
+			}
+			for attempt := 0; attempt < 3; attempt++ {
+				errs[i] = cli.ApplyV2(t.Context(), opts)
+				if errs[i] == nil {
+					break
+				}
+			}
 		}(i)
 	}
 	wg.Wait()

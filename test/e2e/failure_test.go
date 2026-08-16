@@ -71,8 +71,19 @@ func TestE2EFailureKeepsCurrent(t *testing.T) {
 	}
 	code, body := env.signedDo(t, adminID, adminSecret, http.MethodPost, reconcilePath,
 		[]byte(`{"idempotency_key":"fail-key-2","force":true,"reason":"故障演练"}`))
-	if code != http.StatusInternalServerError {
-		t.Fatalf("签发失败的 force reconcile 状态码 = %d，期望 500: %s", code, body)
+	if code != http.StatusAccepted {
+		t.Fatalf("签发失败的 force reconcile 状态码 = %d，期望 202: %s", code, body)
+	}
+	var accepted certproto.JobAcceptedResponse
+	if err := json.Unmarshal(body, &accepted); err != nil {
+		t.Fatal(err)
+	}
+	if err := accepted.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	job := env.waitJob(t, adminID, adminSecret, accepted.Location)
+	if job.State != certproto.JobStateFailed {
+		t.Fatalf("签发失败任务状态 = %q，期望 failed", job.State)
 	}
 	if got := env.issuer.calls.Load(); got != 2 {
 		t.Fatalf("签发次数 = %d，期望 2（首次成功 + force 失败）", got)

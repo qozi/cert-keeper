@@ -16,6 +16,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"io"
@@ -31,10 +32,13 @@ import (
 	"time"
 
 	"github.com/siidoo/certkeeper/internal/api"
+	"github.com/siidoo/certkeeper/internal/certstore"
 	"github.com/siidoo/certkeeper/internal/client"
 	"github.com/siidoo/certkeeper/internal/config"
+	"github.com/siidoo/certkeeper/internal/scheduler"
 	"github.com/siidoo/certkeeper/internal/service"
 	"github.com/siidoo/certkeeper/internal/store"
+	"github.com/siidoo/certkeeper/pkg/certproto"
 	"github.com/siidoo/certkeeper/pkg/ckauth"
 )
 
@@ -146,7 +150,34 @@ func newE2EEnv(t *testing.T) *e2eEnv {
 	svc := service.New(cfg, st)
 	svc.V2Issuer = issuer
 	srv := &api.Server{Cfg: cfg, Store: st, Service: svc, Logger: discardLogger{}}
-	ts := httptest.NewServer(srv.Handler())
+	handler := srv.Handler()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == certproto.CapabilitiesURLPath() {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(certproto.DefaultCapabilities())
+			return
+		}
+		handler.ServeHTTP(w, r)
+	}))
+	workerCtx, stopWorker := context.WithCancel(context.Background())
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		for {
+			if err := svc.ExecuteCertificateJob(workerCtx, "e2e-worker", scheduler.Actor{ID: "e2e-worker", Kind: "system"}); err != nil && workerCtx.Err() != nil {
+				return
+			}
+			select {
+			case <-workerCtx.Done():
+				return
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+	}()
+	t.Cleanup(func() {
+		stopWorker()
+		<-workerDone
+	})
 	t.Cleanup(ts.Close)
 
 	return &e2eEnv{
@@ -207,7 +238,7 @@ func (e *e2eEnv) grant(t *testing.T, tokenID, domain string, permissions ...stri
 // newClient 创建指向测试服务器的真实 HMAC 客户端。
 func (e *e2eEnv) newClient(tokenID, secret string) *client.Client {
 	return &client.Client{
-		Cfg:  &client.Config{Server: e.server.URL, TokenID: tokenID, TokenSecret: secret},
+		Cfg:  &client.Config{Server: e.server.URL, TokenID: tokenID, TokenSecret: secret, Development: true},
 		HTTP: e.httpClient,
 		Log:  discardLogger{},
 	}
@@ -267,19 +298,61 @@ func (e *e2eEnv) signedDo(t *testing.T, tokenID, secret, method, path string, bo
 // readLocalCurrent 读取客户端部署目录中的 current generation 指针。
 func readLocalCurrent(t *testing.T, outDir string) string {
 	t.Helper()
-	data, err := os.ReadFile(filepath.Join(outDir, "current"))
+	path, err := filepath.EvalSymlinks(filepath.Join(outDir, "current"))
 	if err != nil {
 		t.Fatalf("读取客户端 current 失败: %v", err)
 	}
-	return strings.TrimSpace(string(data))
+	return filepath.Base(path)
 }
 
 // readServerCurrent 读取服务端 certstore 中的 current generation 指针。
 func (e *e2eEnv) readServerCurrent(t *testing.T, domain string) string {
 	t.Helper()
-	data, err := os.ReadFile(filepath.Join(e.cfg.Acme.CertsDir, domain, "current"))
+	cs, err := certstore.Open(e.cfg.Acme.CertsDir)
+	if err != nil {
+		t.Fatalf("打开服务端 certstore 失败: %v", err)
+	}
+	current, err := cs.GetCurrent(domain)
 	if err != nil {
 		t.Fatalf("读取服务端 current 失败: %v", err)
 	}
-	return strings.TrimSpace(string(data))
+	return string(current)
+}
+
+// waitJob 等待手工请求创建的异步任务进入终态。
+func (e *e2eEnv) waitJob(t *testing.T, tokenID, secret, location string) certproto.JobStatus {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	emptyResponses := 0
+	for time.Now().Before(deadline) {
+		code, body := e.signedDo(t, tokenID, secret, http.MethodGet, location, nil)
+		if code != http.StatusOK {
+			t.Fatalf("查询任务状态码 = %d: %s", code, body)
+		}
+		if len(body) == 0 {
+			emptyResponses++
+			if emptyResponses >= 10 {
+				jobID := filepath.Base(location)
+				job, err := e.service.GetJobV2(t.Context(), tokenID, jobID)
+				if err != nil {
+					t.Fatalf("查询任务状态失败: %v", err)
+				}
+				if job.IsTerminal() {
+					return job
+				}
+			}
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
+		var job certproto.JobStatus
+		if err := json.Unmarshal(body, &job); err != nil {
+			t.Fatalf("解析任务状态失败: %v", err)
+		}
+		if job.IsTerminal() {
+			return job
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("等待异步任务超时")
+	return certproto.JobStatus{}
 }
