@@ -1,0 +1,49 @@
+name: Pebble / Fake CA 验收
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: 已配置 PEBBLE_DIRECTORY_URL 和 PEBBLE_ACCEPTANCE_COMMAND 的 GitHub Environment
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: auto
+
+jobs:
+  acceptance:
+    name: ${{ inputs.profile }} 真实 CA 验收
+    runs-on: ubuntu-24.04
+    environment: ${{ inputs.profile }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: 配置 Go
+        uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: 校验验收入口
+        shell: bash
+        env:
+          PEBBLE_PROFILE: ${{ inputs.profile }}
+          PEBBLE_DIRECTORY_URL: ${{ vars.PEBBLE_DIRECTORY_URL }}
+          PEBBLE_ACCEPTANCE_COMMAND: ${{ vars.PEBBLE_ACCEPTANCE_COMMAND }}
+        run: |
+          set -euo pipefail
+          [[ -n "$PEBBLE_PROFILE" ]]
+          [[ "$PEBBLE_DIRECTORY_URL" =~ ^https?://[^[:space:]]+/dir(ectory)?/?$ ]]
+          [[ -n "$PEBBLE_ACCEPTANCE_COMMAND" ]]
+      - name: 执行真实验收
+        shell: bash
+        env:
+          PEBBLE_PROFILE: ${{ inputs.profile }}
+          PEBBLE_DIRECTORY_URL: ${{ vars.PEBBLE_DIRECTORY_URL }}
+          PEBBLE_ACCEPTANCE_COMMAND: ${{ vars.PEBBLE_ACCEPTANCE_COMMAND }}
+        run: |
+          set -euo pipefail
+          bash -euo pipefail -c "$PEBBLE_ACCEPTANCE_COMMAND"
