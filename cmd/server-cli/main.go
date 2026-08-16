@@ -23,15 +23,18 @@ import (
 )
 
 type cli struct {
-	out     io.Writer
-	errOut  io.Writer
-	in      io.Reader
-	format  string
-	config  string
-	showVal bool
-	ctx     context.Context
-	st      *store.Store
-	svc     *service.Service
+	out              io.Writer
+	errOut           io.Writer
+	in               io.Reader
+	format           string
+	config           string
+	showVal          bool
+	confirmSensitive bool
+	showPrivateKey   bool
+	ctx              context.Context
+	cfg              *config.Config
+	st               *store.Store
+	svc              *service.Service
 }
 
 func main() {
@@ -53,11 +56,15 @@ func run(args []string, out, errOut io.Writer, in io.Reader) error {
 	configPath := "/data/config/config.yaml"
 	format := "table"
 	showValue := false
+	confirmSensitive := false
+	showPrivateKey := false
 	showVersion := false
 	global.StringVar(&configPath, "c", configPath, "服务端配置文件路径")
 	global.StringVar(&configPath, "config", configPath, "服务端配置文件路径")
 	global.StringVar(&format, "output", format, "输出格式：table 或 json")
 	global.BoolVar(&showValue, "show-value", false, "显示 DNS Secret 明文，仅用于 secret list")
+	global.BoolVar(&confirmSensitive, "confirm-sensitive", false, "确认当前命令需要输出敏感信息")
+	global.BoolVar(&showPrivateKey, "show-private-key", false, "允许将私钥输出到标准输出")
 	global.BoolVar(&showVersion, "version", false, "显示版本")
 	if err := global.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -65,6 +72,14 @@ func run(args []string, out, errOut io.Writer, in io.Reader) error {
 			return nil
 		}
 		return err
+	}
+	if hasCLIFlag(args, "--version") || hasCLIFlag(args, "-version") {
+		fmt.Fprintln(out, version.String(version.ServerCLIComponent))
+		return nil
+	}
+	if hasCLIFlag(args, "--help") || hasCLIFlag(args, "-h") {
+		printUsage(out)
+		return nil
 	}
 	if showVersion {
 		fmt.Fprintln(out, version.String(version.ServerCLIComponent))
@@ -78,6 +93,9 @@ func run(args []string, out, errOut io.Writer, in io.Reader) error {
 		printUsage(out)
 		return nil
 	}
+	if err := validateCLICommandNames(global.Args()); err != nil {
+		return err
+	}
 	if format != "table" && format != "json" {
 		return fmt.Errorf("不支持的输出格式: %s", format)
 	}
@@ -86,22 +104,21 @@ func run(args []string, out, errOut io.Writer, in io.Reader) error {
 	if err != nil {
 		return fmt.Errorf("加载配置失败: %w", err)
 	}
+	if shouldRunWithoutStore(global.Args()) {
+		c := &cli{out: out, errOut: errOut, in: in, format: format, config: configPath,
+			showVal: showValue, confirmSensitive: confirmSensitive, showPrivateKey: showPrivateKey,
+			ctx: context.Background(), cfg: cfg}
+		return c.dispatch(global.Args())
+	}
 	st, err := store.Open(cfg.Storage.SQLitePath)
 	if err != nil {
 		return fmt.Errorf("打开数据库失败: %w", err)
 	}
 	defer st.Close()
 
-	c := &cli{
-		out:     out,
-		errOut:  errOut,
-		in:      in,
-		format:  format,
-		showVal: showValue,
-		ctx:     context.Background(),
-		st:      st,
-		svc:     service.New(cfg, st),
-	}
+	c := &cli{out: out, errOut: errOut, in: in, format: format, config: configPath,
+		showVal: showValue, confirmSensitive: confirmSensitive, showPrivateKey: showPrivateKey,
+		ctx: context.Background(), cfg: cfg, st: st, svc: service.New(cfg, st)}
 	return c.dispatch(global.Args())
 }
 
@@ -112,13 +129,20 @@ func (c *cli) dispatch(args []string) error {
 	}
 	switch args[0] {
 	case "cert":
-		return c.cert(args[1:])
+		return c.certV2(args[1:])
 	case "token":
-		return c.token(args[1:])
+		return c.tokenV2(args[1:])
 	case "cert-config":
-		return c.certConfig(args[1:])
+		return c.certConfigV2(args[1:])
 	case "secret":
-		return c.secret(args[1:])
+		return c.secretV2(args[1:])
+	case "profile", "dns-profile":
+		return c.profileV2(args[1:])
+	case "dns":
+		if len(args) < 2 || args[1] != "profile" {
+			return errors.New("dns 目前只支持 profile")
+		}
+		return c.profileV2(args[2:])
 	case "provider":
 		return c.provider(args[1:])
 	case "client":
@@ -126,11 +150,15 @@ func (c *cli) dispatch(args []string) error {
 	case "log":
 		return c.log(args[1:])
 	case "grant":
-		return c.grant(args[1:])
+		return c.grantV2(args[1:])
 	case "job":
-		return c.job(args[1:])
+		return c.jobV2(args[1:])
 	case "generation":
-		return c.generation(args[1:])
+		return c.generationV2(args[1:])
+	case "backup":
+		return c.backupV2(args[1:])
+	case "migrate":
+		return c.migrateV2(args[1:])
 	case "audit":
 		return c.audit(args[1:])
 	case "help", "-h", "--help":
@@ -890,20 +918,25 @@ func printUsage(out io.Writer) {
 全局参数:
   -c, --config FILE       服务端配置文件（默认 /data/config/config.yaml）
   --output table|json     输出格式（默认 table）
-  --show-value            secret list 显示 Secret 明文
+  --show-value            secret list 显示 Secret 明文（必须同时 --confirm-sensitive）
+  --confirm-sensitive     确认输出敏感信息
+  --show-private-key      允许私钥输出到标准输出
   --version               显示版本
 
 资源:
-  cert       apply/status/status-all/file/list/reissue
-  token      list/get/create/update/delete
+  cert       apply/status/status-all/file/list/reissue/revoke/remove/delete
+  token      list/get/create/update/delete/rotate
   cert-config list/set/delete
-  secret     list/set/delete
+  profile    list/get/create/update/delete
+  secret     list/set/delete（必须指定 provider/profile）
   provider   list/parameters
   client     list
   log        list
   grant      add/remove/list
-  job        list/show
-  generation list/deployments
+  job        list/show/retry/cancel
+  generation list/show/gc/deployments
+  backup     create/verify/restore
+  migrate    status/verify
   audit      list
 
 示例:

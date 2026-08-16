@@ -238,3 +238,27 @@ func TestJobList(t *testing.T) {
 		t.Fatalf("job list 状态过滤结果不符合预期: %s", out)
 	}
 }
+
+// TestSensitiveArguments 校验 Secret 和私钥的默认保护策略。
+func TestSensitiveArguments(t *testing.T) {
+	configPath, _ := writeTestConfig(t)
+	if _, err := runCLI(t, "--config", configPath, "secret", "set", "--provider", "dns_cf", "--profile", "prod", "--env-key", "CF_Key", "--value", "secret"); err == nil || (!strings.Contains(err.Error(), "禁止使用 --value") && !strings.Contains(err.Error(), "not defined")) {
+		t.Fatalf("secret set 应拒绝 --value: %v", err)
+	}
+	if _, err := runCLI(t, "--config", configPath, "--show-value", "secret", "list", "--provider", "dns_cf", "--profile", "prod"); err == nil || !strings.Contains(err.Error(), "confirm-sensitive") {
+		t.Fatalf("show-value 应要求确认: %v", err)
+	}
+}
+
+// TestHelpAndVersionDoNotOpenDatabase 确保 help/version 不依赖数据库或迁移。
+func TestHelpAndVersionDoNotOpenDatabase(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing-config.yaml")
+	var out bytes.Buffer
+	if err := run([]string{"--config", missing, "--version"}, &out, &out, bytes.NewReader(nil)); err != nil {
+		t.Fatalf("version 不应读取数据库或配置: %v", err)
+	}
+	out.Reset()
+	if err := run([]string{"--config", missing, "--help"}, &out, &out, bytes.NewReader(nil)); err != nil {
+		t.Fatalf("help 不应读取数据库或配置: %v", err)
+	}
+}
