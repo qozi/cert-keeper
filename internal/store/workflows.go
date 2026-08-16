@@ -897,7 +897,7 @@ func isTerminalJobStatus(status string) bool {
 
 func validGenerationStatus(status string) bool {
 	switch status {
-	case "pending", "issued", "failed", "revoked":
+	case "pending", "publishing", "issued", "failed", "revoked":
 		return true
 	default:
 		return false

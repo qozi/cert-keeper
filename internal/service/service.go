@@ -113,6 +113,10 @@ func (s *Service) Delete(ctx context.Context, req LifecycleRequest) error {
 	if current != nil {
 		return fmt.Errorf("无法原子删除 current generation: %w", certstore.ErrCurrentGeneration)
 	}
+	// 实际删除证书配置记录
+	if err := s.Store.DeleteCert(ctx, req.Domain); err != nil {
+		return err
+	}
 	s.auditV2(req.Actor, req.Domain, "delete", "succeeded", "删除证书生命周期记录")
 	return nil
 }
@@ -261,9 +265,8 @@ func (s *Service) Apply(ctx context.Context, req ApplyRequest) (result ApplyResu
 		DNSEnv:        dnsEnv,
 	})
 	if issueErr != nil {
-		if res != nil && res.StdoutStderr != "" {
-			issueErr = fmt.Errorf("%w\n%s", issueErr, res.StdoutStderr)
-		}
+		// acme.sh 原始输出不进入错误链和日志，避免 DNS 凭据、EAB 等敏感内容持久化。
+		// 仅在 debug 模式（或其他未来扩展）时记录，当前直接丢弃。
 		return result, issueErr
 	}
 	if res != nil {

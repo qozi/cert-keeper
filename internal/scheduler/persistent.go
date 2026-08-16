@@ -105,7 +105,7 @@ type PersistentStore interface {
 	ListCandidates(ctx context.Context) ([]Candidate, error)
 	CreateJob(ctx context.Context, spec JobSpec) (job Job, created bool, err error)
 	ClaimJob(ctx context.Context, request ClaimRequest) (*Job, error)
-	RenewLease(ctx context.Context, renewal LeaseRenewal) (bool, error)
+	RenewLease(ctx context.Context, renewal LeaseRenewal) (newVersion uint64, ok bool, err error)
 	UpdateJob(ctx context.Context, update JobUpdate) (bool, error)
 	RecordSkippedCandidate(ctx context.Context, record SkipRecord) error
 }
@@ -362,12 +362,19 @@ func (w *PersistentWorker) processDueJobs(ctx context.Context, recorder *persist
 	workers.Wait()
 }
 
+// renewalResult 携带续租 goroutine 的最终版本号和错误。
+type renewalResult struct {
+	version uint64
+	err     error
+}
+
 func (w *PersistentWorker) executeJob(ctx context.Context, job Job, recorder *persistentRecorder) {
 	jobCtx, cancelJob := context.WithCancel(ctx)
 	stopRenewal := make(chan struct{})
-	renewalDone := make(chan error, 1)
+	renewalDone := make(chan renewalResult, 1)
 	go func() {
-		renewalDone <- w.renewLease(jobCtx, job.ID, job.LeaseVersion, stopRenewal, cancelJob)
+		v, err := w.renewLease(jobCtx, job.ID, job.LeaseVersion, stopRenewal, cancelJob)
+		renewalDone <- renewalResult{version: v, err: err}
 	}()
 
 	actor := job.Actor
@@ -376,16 +383,20 @@ func (w *PersistentWorker) executeJob(ctx context.Context, job Job, recorder *pe
 	}
 	result, reconcileErr := w.reconciler.ReconcileJob(jobCtx, actor, job)
 	close(stopRenewal)
-	renewalErr := <-renewalDone
+	renewal := <-renewalDone
 	cancelJob()
+
+	// 将 job 的 LeaseVersion 更新为续租后的最终版本，
+	// 确保后续 UpdateJob / releaseCanceledJob 使用最新版本号，防止乐观锁校验失败。
+	job.LeaseVersion = renewal.version
 
 	if ctx.Err() != nil {
 		w.releaseCanceledJob(job, ctx.Err(), recorder)
 		recorder.addError(ctx.Err())
 		return
 	}
-	if renewalErr != nil {
-		recorder.addError(fmt.Errorf("任务 %s 续租失败: %w", job.ID, renewalErr))
+	if renewal.err != nil {
+		recorder.addError(fmt.Errorf("任务 %s 续租失败: %w", job.ID, renewal.err))
 		return
 	}
 	if reconcileErr == nil {
@@ -421,29 +432,35 @@ func (w *PersistentWorker) executeJob(ctx context.Context, job Job, recorder *pe
 	recorder.addError(fmt.Errorf("协调 %s 已停止: %w", job.Candidate.Domain, reconcileErr))
 }
 
-func (w *PersistentWorker) renewLease(ctx context.Context, id string, leaseVersion uint64, stop <-chan struct{}, cancel context.CancelFunc) error {
+// renewLease 定期续租，每次成功后将 currentVersion 更新为 store 返回的新版本号，
+// 避免乐观锁场景下因版本号过期导致续租失败、任务被强制中断。
+// 返回值为最终版本号（供 executeJob 传给 UpdateJob）和错误。
+func (w *PersistentWorker) renewLease(ctx context.Context, id string, leaseVersion uint64, stop <-chan struct{}, cancel context.CancelFunc) (uint64, error) {
+	currentVersion := leaseVersion
 	ticker := w.config.Clock.NewTicker(w.config.RenewInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-stop:
-			return nil
+			return currentVersion, nil
 		case <-ctx.Done():
-			return ctx.Err()
+			return currentVersion, ctx.Err()
 		case <-ticker.Chan():
 			now := w.config.Clock.Now()
-			ok, err := w.store.RenewLease(ctx, LeaseRenewal{
-				ID: id, Owner: w.config.Owner, Now: now, LeaseVersion: leaseVersion,
+			newVersion, ok, err := w.store.RenewLease(ctx, LeaseRenewal{
+				ID: id, Owner: w.config.Owner, Now: now, LeaseVersion: currentVersion,
 				LeaseUntil: now.Add(w.config.LeaseDuration),
 			})
 			if err != nil {
 				cancel()
-				return err
+				return currentVersion, err
 			}
 			if !ok {
 				cancel()
-				return errors.New("lease 已丢失")
+				return currentVersion, errors.New("lease 已丢失")
 			}
+			// 续租成功，更新版本号供下次续租使用
+			currentVersion = newVersion
 		}
 	}
 }

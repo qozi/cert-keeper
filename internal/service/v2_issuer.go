@@ -60,7 +60,8 @@ func (i *acmeV2Issuer) Issue(ctx context.Context, params V2IssueParams) error {
 		// 刻意忽略 res.StdoutStderr，避免把 ACME 原始输出传回调用方。
 		return err
 	}
-	if res == nil || res.Status != acme.OperationSucceeded {
+	// OperationSkipped 表示证书未到期、acme.sh 跳过签发，视为成功。
+	if res == nil || (res.Status != acme.OperationSucceeded && res.Status != acme.OperationSkipped) {
 		return errors.New("ACME 签发未完成")
 	}
 	return nil

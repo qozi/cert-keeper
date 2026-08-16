@@ -10,15 +10,24 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DIST="$ROOT/dist"
 
+# 版本信息（构建时注入）
+VERSION=$(git -C "$ROOT" describe --tags --always --dirty 2>/dev/null || echo "dev")
+COMMIT=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+LDFLAGS="-s -w \
+  -X github.com/siidoo/certkeeper/internal/version.Version=${VERSION} \
+  -X github.com/siidoo/certkeeper/internal/version.GitCommit=${COMMIT} \
+  -X github.com/siidoo/certkeeper/internal/version.BuildDate=${DATE}"
+
 build_native() {
     mkdir -p "$DIST"
     cd "$ROOT"
-    echo "==> 构建 certk-server ($(go env GOOS)/$(go env GOARCH))"
-    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$DIST/certk-server" ./cmd/server
+    echo "==> 构建 certk-server ($(go env GOOS)/$(go env GOARCH))  version=${VERSION} commit=${COMMIT}"
+    CGO_ENABLED=0 go build -trimpath -ldflags="${LDFLAGS}" -o "$DIST/certk-server" ./cmd/server
     echo "==> 构建 certk-server-cli ($(go env GOOS)/$(go env GOARCH))"
-    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$DIST/certk-server-cli" ./cmd/server-cli
+    CGO_ENABLED=0 go build -trimpath -ldflags="${LDFLAGS}" -o "$DIST/certk-server-cli" ./cmd/server-cli
     echo "==> 构建 certk-client ($(go env GOOS)/$(go env GOARCH))"
-    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$DIST/certk-client" ./cmd/client
+    CGO_ENABLED=0 go build -trimpath -ldflags="${LDFLAGS}" -o "$DIST/certk-client" ./cmd/client
     echo "==> 完成: $DIST"
 }
 
@@ -37,13 +46,13 @@ build_all() {
         local arch="${t#*/}"
         local out="$DIST/certk-server-${os}-${arch}"
         echo "==> 构建 certk-server $os/$arch"
-        CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -ldflags="-s -w" -o "$out" ./cmd/server
+        CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -ldflags="${LDFLAGS}" -o "$out" ./cmd/server
         local out_cli="$DIST/certk-server-cli-${os}-${arch}"
         echo "==> 构建 certk-server-cli $os/$arch"
-        CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -ldflags="-s -w" -o "$out_cli" ./cmd/server-cli
+        CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -ldflags="${LDFLAGS}" -o "$out_cli" ./cmd/server-cli
         local outc="$DIST/certk-client-${os}-${arch}"
         echo "==> 构建 certk-client $os/$arch"
-        CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -ldflags="-s -w" -o "$outc" ./cmd/client
+        CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -ldflags="${LDFLAGS}" -o "$outc" ./cmd/client
     done
     echo "==> 完成: $DIST"
 }

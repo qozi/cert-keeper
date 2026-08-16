@@ -146,7 +146,10 @@ func TestNewHTTPServerTimeouts(t *testing.T) {
 	cfg.Server.WriteTimeout = 61 * time.Second
 	cfg.Server.IdleTimeout = 29 * time.Second
 
-	srv := newHTTPServer(cfg, http.NewServeMux())
+	srv, err := newHTTPServer(cfg, http.NewServeMux())
+	if err != nil {
+		t.Fatalf("newHTTPServer 返回意外错误: %v", err)
+	}
 	if srv.Addr != ":18443" {
 		t.Fatalf("Addr 应为 :18443，实际 %s", srv.Addr)
 	}

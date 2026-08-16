@@ -143,6 +143,9 @@ func Load(path string) (*Config, error) {
 	cfg := Default()
 	if path == "" {
 		applyEnv(cfg)
+		if err := cfg.Validate(); err != nil {
+			return nil, err
+		}
 		return cfg, nil
 	}
 	data, err := os.ReadFile(path)

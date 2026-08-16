@@ -68,7 +68,8 @@ func DeriveSecret(encKey, id, fallback string) string {
 	if encKey == "" {
 		return fallback
 	}
-	return hmacHex(id+"|"+encKey, encKey)[:SecretLen]
+	// SHA-256 HMAC 输出 32 字节 = 64 十六进制字符，SecretLen*2=64 恰好取完整输出，保留 256 位熵。
+	return hmacHex(id+"|"+encKey, encKey)[:SecretLen*2]
 }
 
 // 计算 HMAC 风格签名：sha256(method + path + ts + nonce + bodySHA256 + secret)

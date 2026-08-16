@@ -124,24 +124,6 @@ func (c *Client) doRequestCtx(ctx context.Context, method, path string, body any
 		h := sha256.Sum256(bodyBytes)
 		bodyHash = hex.EncodeToString(h[:])
 	}
-	ts := ckauth.Now()
-	nonce, err := ckauth.GenNonce()
-	if err != nil {
-		return nil, nil, err
-	}
-	sig := ckauth.Sign(method, path, ts, nonce, bodyHash, c.Cfg.TokenSecret)
-	req, err := http.NewRequestWithContext(ctx, method, c.Cfg.Server+path, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return nil, nil, err
-	}
-	req.Header.Set(ckauth.HeaderTokenID, c.Cfg.TokenID)
-	req.Header.Set(ckauth.HeaderTimestamp, fmt.Sprintf("%d", ts))
-	req.Header.Set(ckauth.HeaderNonce, nonce)
-	req.Header.Set("X-CK-BodyHash", bodyHash)
-	req.Header.Set(ckauth.HeaderSignature, sig)
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
 	min, max := c.RetryMin, c.RetryMax
 	if min <= 0 {
 		min = 100 * time.Millisecond
@@ -150,12 +132,24 @@ func (c *Client) doRequestCtx(ctx context.Context, method, path string, body any
 		max = 5 * time.Second
 	}
 	for attempt := 0; ; attempt++ {
-		if attempt > 0 && req.GetBody != nil {
-			body, err := req.GetBody()
-			if err != nil {
-				return nil, nil, err
-			}
-			req.Body = body
+		// 每次重试重新生成时间戳、nonce 和签名，避免服务端因 nonce 重放拒绝请求。
+		ts := ckauth.Now()
+		nonce, err := ckauth.GenNonce()
+		if err != nil {
+			return nil, nil, err
+		}
+		sig := ckauth.Sign(method, path, ts, nonce, bodyHash, c.Cfg.TokenSecret)
+		req, err := http.NewRequestWithContext(ctx, method, c.Cfg.Server+path, bytes.NewReader(bodyBytes))
+		if err != nil {
+			return nil, nil, err
+		}
+		req.Header.Set(ckauth.HeaderTokenID, c.Cfg.TokenID)
+		req.Header.Set(ckauth.HeaderTimestamp, fmt.Sprintf("%d", ts))
+		req.Header.Set(ckauth.HeaderNonce, nonce)
+		req.Header.Set("X-CK-BodyHash", bodyHash)
+		req.Header.Set(ckauth.HeaderSignature, sig)
+		if len(bodyBytes) > 0 {
+			req.Header.Set("Content-Type", "application/json")
 		}
 		resp, err := c.HTTP.Do(req)
 		if err != nil {
@@ -167,7 +161,12 @@ func (c *Client) doRequestCtx(ctx context.Context, method, path string, body any
 			}
 			continue
 		}
-		data, readErr := io.ReadAll(resp.Body)
+		const maxRespBodySize = 10 * 1024 * 1024 // 10MB
+		lr := io.LimitReader(resp.Body, maxRespBodySize+1)
+		data, readErr := io.ReadAll(lr)
+		if readErr == nil && int64(len(data)) > maxRespBodySize {
+			readErr = errors.New("响应体超过大小限制（10MB）")
+		}
 		resp.Body.Close()
 		if readErr != nil {
 			if attempt >= 5 {

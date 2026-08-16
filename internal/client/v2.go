@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -196,16 +197,22 @@ func (c *Client) reconcileV2(ctx context.Context, opts ApplyV2Opts, idempotencyK
 	return &rr, nil
 }
 
+// maxPollAttempts 是轮询任务的最大次数（约 10 分钟）。
+const maxPollAttempts = 600
+
 func (c *Client) pollJobV2(ctx context.Context, location string, initial certproto.JobStatus) (*certproto.ReconcileResponse, error) {
 	job := initial
-	for {
+	delay := 1 * time.Second
+	for attempt := 0; ; attempt++ {
 		if job.IsTerminal() {
 			if job.State != certproto.JobStateSucceeded {
 				return nil, fmt.Errorf("异步任务 %s: %s", job.State, job.Message)
 			}
 			return &certproto.ReconcileResponse{Success: true, Generation: job.Generation, Revision: job.Revision, Job: job}, nil
 		}
-		delay := 100 * time.Millisecond
+		if attempt >= maxPollAttempts {
+			return nil, errors.New("轮询等待超时：任务未在规定时间内完成")
+		}
 		if delayErr := sleepContext(ctx, delay); delayErr != nil {
 			return nil, delayErr
 		}
@@ -218,6 +225,18 @@ func (c *Client) pollJobV2(ctx context.Context, location string, initial certpro
 		}
 		if err := json.Unmarshal(data, &job); err != nil {
 			return nil, fmt.Errorf("解析任务状态失败: %w", err)
+		}
+		// 更新下次轮询间隔：优先遵守 Retry-After，否则指数退避，上限 30s。
+		if v, err := strconv.Atoi(resp.Header.Get("Retry-After")); err == nil && v > 0 {
+			delay = time.Duration(v) * time.Second
+		} else {
+			delay *= 2
+		}
+		if delay < 1*time.Second {
+			delay = 1 * time.Second
+		}
+		if delay > 30*time.Second {
+			delay = 30 * time.Second
 		}
 	}
 }

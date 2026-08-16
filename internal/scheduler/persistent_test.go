@@ -95,16 +95,18 @@ func (s *persistentMemoryStore) ClaimJob(ctx context.Context, request ClaimReque
 	return nil, nil
 }
 
-func (s *persistentMemoryStore) RenewLease(ctx context.Context, renewal LeaseRenewal) (bool, error) {
+func (s *persistentMemoryStore) RenewLease(ctx context.Context, renewal LeaseRenewal) (uint64, bool, error) {
 	if err := ctx.Err(); err != nil {
-		return false, err
+		return renewal.LeaseVersion, false, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	job, ok := s.jobs[renewal.ID]
 	if !ok || job.Status != JobRunning || job.LeaseOwner != renewal.Owner || job.LeaseVersion != renewal.LeaseVersion || !job.LeaseExpiresAt.After(renewal.Now) {
-		return false, nil
+		return renewal.LeaseVersion, false, nil
 	}
+	// 续租成功，递增版本号以模拟乐观锁语义
+	job.LeaseVersion++
 	job.LeaseExpiresAt = renewal.LeaseUntil
 	s.jobs[job.ID] = job
 	if s.renewedCalls != nil {
@@ -113,7 +115,7 @@ func (s *persistentMemoryStore) RenewLease(ctx context.Context, renewal LeaseRen
 		default:
 		}
 	}
-	return true, nil
+	return job.LeaseVersion, true, nil
 }
 
 func (s *persistentMemoryStore) UpdateJob(ctx context.Context, update JobUpdate) (bool, error) {

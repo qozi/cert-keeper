@@ -45,7 +45,7 @@ func (s *Server) tokensHandler(w http.ResponseWriter, r *http.Request) {
 			Secret  string `json:"secret"`
 			Note    string `json:"note"`
 			IsAdmin bool   `json:"is_admin"`
-			Enabled bool   `json:"enabled"`
+			Enabled *bool  `json:"enabled"` // 指针区分"未提供"与显式 false，默认启用
 			AutoGen bool   `json:"auto_gen"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -68,11 +68,16 @@ func (s *Server) tokensHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			req.Secret = sec
 		}
+		// 未提供 enabled 字段时默认启用，避免 Token 创建即禁用
+		enabled := true
+		if req.Enabled != nil {
+			enabled = *req.Enabled
+		}
 		t := &store.Token{
 			ID:        req.ID,
 			Secret:    req.Secret,
 			Note:      req.Note,
-			Enabled:   req.Enabled,
+			Enabled:   enabled,
 			IsAdmin:   req.IsAdmin,
 			CreatedAt: time.Now().Unix(),
 		}
@@ -92,7 +97,10 @@ func (s *Server) tokensHandler(w http.ResponseWriter, r *http.Request) {
 			Enabled bool   `json:"enabled"`
 			IsAdmin bool   `json:"is_admin"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&req)
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体格式错误: " + err.Error()})
+			return
+		}
 		if err := s.Store.UpdateToken(r.Context(), parts[0], req.Note, req.Enabled, req.IsAdmin); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return

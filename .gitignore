@@ -9,6 +9,11 @@ dist/
 *.so
 *.dylib
 
+# 根目录误生成的本地二进制（应使用 ./scripts/build.sh 输出到 dist/）
+/server
+/server-cli
+/client
+
 # Go
 vendor/
 

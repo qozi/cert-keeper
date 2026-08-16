@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/siidoo/certkeeper/internal/config"
@@ -32,13 +33,24 @@ type Server struct {
 	// Metrics 是可选的可观测性注册中心；为 nil 时不暴露 /metrics 与 /readyz。
 	Metrics *observability.Registry
 	now     func() time.Time
+
+	// serviceOnce 保证 serviceSvc 仅被初始化一次，防止并发请求产生 data race。
+	serviceOnce sync.Once
+	serviceSvc  *service.Service
 }
 
+// service 返回懒初始化的 Service 实例。
+// 若外部已通过 Server.Service 字段预置实例（如测试场景），则直接使用该实例；
+// 否则调用 service.New 创建，整个过程由 sync.Once 保护，线程安全。
 func (s *Server) service() *service.Service {
-	if s.Service == nil {
-		s.Service = service.New(s.Cfg, s.Store)
-	}
-	return s.Service
+	s.serviceOnce.Do(func() {
+		if s.Service != nil {
+			s.serviceSvc = s.Service
+		} else {
+			s.serviceSvc = service.New(s.Cfg, s.Store)
+		}
+	})
+	return s.serviceSvc
 }
 
 // Logger 是日志记录器接口，支持 Info/Warn/Error 三个级别。

@@ -101,6 +101,16 @@ func (s *Service) executeClaimedV2Job(ctx context.Context, actor scheduler.Actor
 		s.auditV2("", job.Domain, "reconcile_v2", "succeeded", "证书未到期，跳过签发")
 		return scheduler.Result{}, nil
 	}
+	// 崩溃恢复：检查是否有同域名且处于 "publishing" 状态的遗留代次。
+	// 若 certstore 中已有该代次的文件，则补全 SQLite 状态后跳过重新签发。
+	if recovered, recErr := s.recoverPublishingGeneration(ctx, cs, job); recErr != nil {
+		_ = s.Store.UpdateJobStatus(context.Background(), job.ID, "failed", "崩溃恢复失败: "+recErr.Error())
+		return scheduler.Result{}, recErr
+	} else if recovered {
+		_ = s.Store.UpdateJobStatus(context.Background(), job.ID, "succeeded", "")
+		s.auditV2("", job.Domain, "reconcile_v2", "succeeded", "崩溃恢复：已补全上次发布的代次状态")
+		return scheduler.Result{}, nil
+	}
 	generation, err := s.Store.CreateCertificateGeneration(ctx, &store.CertificateGeneration{JobID: job.ID, Domain: job.Domain})
 	if err != nil {
 		return s.finishV2Failure(job, owner, actor, err)
@@ -127,6 +137,10 @@ func (s *Service) executeClaimedV2Job(ctx context.Context, actor scheduler.Actor
 	if err != nil {
 		return s.finishV2GenerationFailure(job, generation, owner, actor, err)
 	}
+	// 记录发布意图：进入 publishing 状态，崩溃后可通过恢复逻辑检测。
+	if err = s.Store.UpdateCertificateGenerationStatus(ctx, generation.ID, "publishing", "", "", "", nil, nil); err != nil {
+		return s.finishV2GenerationFailure(job, generation, owner, actor, fmt.Errorf("记录发布意图失败: %w", err))
+	}
 	published, _, err := cs.PublishWithSAN(job.Domain, stagingDir, splitCSV(preset.SAN))
 	if err != nil {
 		return s.finishV2GenerationFailure(job, generation, owner, actor, err)
@@ -145,7 +159,9 @@ func (s *Service) executeClaimedV2Job(ctx context.Context, actor scheduler.Actor
 	if err = s.Store.UpdateCertificateGenerationStatus(ctx, generation.ID, "issued", string(published), string(published), "", nil, notAfterUnix); err != nil {
 		return s.finishV2GenerationFailure(job, generation, owner, actor, err)
 	}
-	_ = s.Store.UpdateCertificateGenerationArtifact(ctx, generation.ID, store.GenerationArtifact{Revision: int64(manifest.Revision), ManifestDigest: manifestDigest(manifest), Serial: manifest.Serial, Fingerprint: manifest.Fingerprint, Current: true})
+	if err = s.Store.UpdateCertificateGenerationArtifact(ctx, generation.ID, store.GenerationArtifact{Revision: int64(manifest.Revision), ManifestDigest: manifestDigest(manifest), Serial: manifest.Serial, Fingerprint: manifest.Fingerprint, Current: true}); err != nil {
+		return s.finishV2GenerationFailure(job, generation, owner, actor, fmt.Errorf("更新 generation artifact 失败: %w", err))
+	}
 	if err = s.Store.UpdateJobStatus(context.Background(), job.ID, "succeeded", ""); err != nil {
 		return scheduler.Result{}, err
 	}
@@ -177,7 +193,9 @@ func (s *Service) finishV2GenerationFailure(job *store.CertificateJob, generatio
 }
 
 func v2Retryable(err error) bool {
-	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || strings.Contains(strings.ToLower(err.Error()), "超时")
+	return errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, context.Canceled) ||
+		scheduler.ClassifyError(err) == scheduler.ErrorTemporary
 }
 
 func errOr(err, fallback error) error {
@@ -739,4 +757,61 @@ func v2OrDefault(value, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+// recoverPublishingGeneration 检查该域名是否存在处于 "publishing" 状态的遗留代次。
+// 若 certstore 已有对应文件，则补全 SQLite 状态（finalize），返回 true；
+// 否则将遗留代次标为 failed，返回 false。
+func (s *Service) recoverPublishingGeneration(ctx context.Context, cs *certstore.Store, job *store.CertificateJob) (bool, error) {
+	generations, err := s.Store.ListCertificateGenerations(ctx, job.Domain)
+	if err != nil {
+		return false, err
+	}
+	for i := range generations {
+		gen := &generations[i]
+		if gen.Status != "publishing" {
+			continue
+		}
+		// 检查 certstore 中 current 是否已是此代次
+		currentGenID, certErr := cs.GetCurrent(job.Domain)
+		if certErr != nil {
+			// certstore 无 current，说明发布未完成，标记为 failed
+			_ = s.Store.UpdateCertificateGenerationStatus(context.Background(), gen.ID, "failed", "", "", "崩溃恢复：certstore 无 current generation", nil, nil)
+			continue
+		}
+		// certstore 有 current，尝试补全 SQLite 状态
+		manifest, manifestErr := cs.LoadManifest(job.Domain, currentGenID)
+		if manifestErr != nil {
+			_ = s.Store.UpdateCertificateGenerationStatus(context.Background(), gen.ID, "failed", "", "", "崩溃恢复：无法读取 manifest", nil, nil)
+			continue
+		}
+		fullManifest, fullManifestErr := cs.LoadGenerationManifest(job.Domain, currentGenID)
+		if fullManifestErr != nil {
+			_ = s.Store.UpdateCertificateGenerationStatus(context.Background(), gen.ID, "failed", "", "", "崩溃恢复：无法读取完整 manifest", nil, nil)
+			continue
+		}
+		_ = manifest // 仅用于确认可读
+		var notAfterUnix *int64
+		if fullchain, readErr := cs.ReadFile(job.Domain, currentGenID, certproto.FileFullchain); readErr == nil {
+			if t, parseErr := acme.ParsePemExpiry(fullchain); parseErr == nil {
+				v := t.Unix()
+				notAfterUnix = &v
+			}
+		}
+		genIDStr := string(currentGenID)
+		if err := s.Store.UpdateCertificateGenerationStatus(ctx, gen.ID, "issued", genIDStr, genIDStr, "", nil, notAfterUnix); err != nil {
+			return false, fmt.Errorf("崩溃恢复：补全代次状态失败: %w", err)
+		}
+		if err := s.Store.UpdateCertificateGenerationArtifact(ctx, gen.ID, store.GenerationArtifact{
+			Revision:       int64(fullManifest.Revision),
+			ManifestDigest: manifestDigest(fullManifest),
+			Serial:         fullManifest.Serial,
+			Fingerprint:    fullManifest.Fingerprint,
+			Current:        true,
+		}); err != nil {
+			return false, fmt.Errorf("崩溃恢复：补全 artifact 失败: %w", err)
+		}
+		return true, nil
+	}
+	return false, nil
 }

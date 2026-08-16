@@ -76,11 +76,13 @@ func main() {
 		logger.Error("打开数据库失败", "err", err)
 		os.Exit(1)
 	}
-	defer st.Close()
+	// 显式 cleanup 函数，避免 os.Exit 绕过 defer 导致 SQLite WAL 未合并
+	cleanup := func() { st.Close() }
 
 	// 引导 admin token
 	if err := bootstrapAdminToken(st, cfg, logger); err != nil {
 		logger.Error("引导 admin token 失败", "err", err)
+		cleanup()
 		os.Exit(1)
 	}
 
@@ -101,11 +103,13 @@ func main() {
 	stdMetrics, err := registry.StandardMetrics()
 	if err != nil {
 		logger.Error("注册标准指标失败", "err", err)
+		cleanup()
 		os.Exit(1)
 	}
 	if cfg.Observability.ReadyEnabled {
 		if err := registerReadinessChecks(registry, cfg, st); err != nil {
 			logger.Error("注册就绪检查失败", "err", err)
+			cleanup()
 			os.Exit(1)
 		}
 	}
@@ -132,12 +136,26 @@ func main() {
 		logger.Info("续期调度器已启动", "interval", cfg.Scheduler.Interval, "jitter", cfg.Scheduler.Jitter)
 	}
 
-	// 启动 nonce 清理 goroutine
-	go startNonceCleaner(st, cfg, logger)
+	// 启动 nonce 清理 goroutine（使用 schedCtx 控制生命周期，随调度器一同退出）
+	nonceDone := make(chan struct{})
+	go func() {
+		defer close(nonceDone)
+		startNonceCleaner(schedCtx, st, cfg, logger)
+	}()
 
 	srv := &api.Server{Cfg: cfg, Store: st, Service: svc, Logger: logger, Metrics: registry}
-	httpSrv := newHTTPServer(cfg, srv.Handler())
+	if cfg.Server.TLSMode == "proxy" {
+		logger.Warn("proxy 模式：服务以明文 HTTP 监听，请确保网络层已隔离后端端口，受信代理校验由网络拓扑负责")
+	}
+	httpSrv, err := newHTTPServer(cfg, srv.Handler())
+	if err != nil {
+		logger.Error("初始化 HTTP 服务器失败", "err", err)
+		cleanup()
+		os.Exit(1)
+	}
 
+	// fatalErr 用于 goroutine 将致命错误传递给 main，避免 goroutine 内直接 os.Exit 绕过 cleanup
+	fatalErr := make(chan error, 1)
 	go func() {
 		logger.Info("HTTP 监听", "addr", cfg.Server.Listen, "tls_mode", cfg.Server.TLSMode)
 		var err error
@@ -148,16 +166,20 @@ func main() {
 		}
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("HTTP 服务异常", "err", err)
-			os.Exit(1)
+			fatalErr <- err
 		}
 	}()
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
-	<-stop
-	logger.Info("收到停止信号，正在关闭")
+	select {
+	case <-stop:
+		logger.Info("收到停止信号，正在关闭")
+	case err := <-fatalErr:
+		logger.Error("HTTP 服务致命错误，正在关闭", "err", err)
+	}
 
-	// 先停止调度器，避免关闭过程中仍在执行签发。
+	// 先停止调度器（同时取消 schedCtx，让 nonce 清理协程一并退出），避免关闭过程中仍在执行签发。
 	stopScheduler()
 	if schedulerDone != nil {
 		select {
@@ -167,26 +189,42 @@ func main() {
 		}
 	}
 
+	// 等待 nonce 清理协程退出，再关闭数据库连接
+	select {
+	case <-nonceDone:
+	case <-time.After(2 * time.Second):
+		logger.Warn("等待 nonce 清理协程退出超时，继续关闭")
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := httpSrv.Shutdown(ctx); err != nil {
 		logger.Error("HTTP 优雅关闭失败", "err", err)
+		cleanup()
 		os.Exit(1)
 	}
+	cleanup()
 	logger.Info("已优雅关闭")
 }
 
 // newHTTPServer 根据配置构造带超时设置的 HTTP 服务器。
-func newHTTPServer(cfg *config.Config, handler http.Handler) *http.Server {
+// 当 ClientMTLS=true 时强制要求客户端证书，CA 文件缺失或无效均返回错误。
+func newHTTPServer(cfg *config.Config, handler http.Handler) (*http.Server, error) {
 	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
-	if cfg.Server.ClientMTLS && cfg.Server.ClientCAFile != "" {
-		if data, err := os.ReadFile(cfg.Server.ClientCAFile); err == nil {
-			pool := x509.NewCertPool()
-			if pool.AppendCertsFromPEM(data) {
-				tlsConfig.ClientCAs = pool
-				tlsConfig.ClientAuth = tls.VerifyClientCertIfGiven
-			}
+	if cfg.Server.ClientMTLS {
+		if cfg.Server.ClientCAFile == "" {
+			return nil, errors.New("server.client_mtls=true 但未设置 client_ca_file")
 		}
+		data, err := os.ReadFile(cfg.Server.ClientCAFile)
+		if err != nil {
+			return nil, fmt.Errorf("读取 client_ca_file 失败: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(data) {
+			return nil, errors.New("client_ca_file 不包含有效 CA 证书")
+		}
+		tlsConfig.ClientCAs = pool
+		tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
 	}
 	return &http.Server{
 		Addr:              cfg.Server.Listen,
@@ -196,7 +234,7 @@ func newHTTPServer(cfg *config.Config, handler http.Handler) *http.Server {
 		WriteTimeout:      cfg.Server.WriteTimeout,
 		IdleTimeout:       cfg.Server.IdleTimeout,
 		TLSConfig:         tlsConfig,
-	}
+	}, nil
 }
 
 // persistentReconciler 将持久任务交给 service 的异步执行入口。
@@ -229,13 +267,24 @@ func (a *persistentStoreAdapter) ClaimJob(ctx context.Context, req scheduler.Cla
 	if err != nil || job == nil {
 		return nil, err
 	}
-	returnJob := adapterJob(*job, scheduler.Candidate{Domain: job.Domain, ChallengeMode: "dns_api"}, scheduler.Actor{ID: "certificate-worker", Kind: "system"})
+	// 查询证书配置以获取真实的 ChallengeMode，避免硬编码 "dns_api"
+	challengeMode := "dns_api" // 兜底默认值
+	if cert, cerr := a.store.GetCert(ctx, job.Domain); cerr != nil {
+		slog.Warn("ClaimJob: 查询证书配置失败，使用默认 ChallengeMode", "domain", job.Domain, "err", cerr)
+	} else if cert != nil && cert.ChallengeMode != "" {
+		challengeMode = cert.ChallengeMode
+	}
+	returnJob := adapterJob(*job, scheduler.Candidate{Domain: job.Domain, ChallengeMode: challengeMode}, scheduler.Actor{ID: "certificate-worker", Kind: "system"})
 	return &returnJob, nil
 }
 
-func (a *persistentStoreAdapter) RenewLease(ctx context.Context, renewal scheduler.LeaseRenewal) (bool, error) {
+func (a *persistentStoreAdapter) RenewLease(ctx context.Context, renewal scheduler.LeaseRenewal) (uint64, bool, error) {
 	err := a.store.RenewLease(ctx, renewal.ID, renewal.Owner, renewal.LeaseUntil.Sub(renewal.Now))
-	return err == nil, err
+	if err != nil {
+		return renewal.LeaseVersion, false, err
+	}
+	// SQL store 不追踪乐观锁版本号，合成递增版本以保持接口语义一致
+	return renewal.LeaseVersion + 1, true, nil
 }
 func (a *persistentStoreAdapter) UpdateJob(ctx context.Context, update scheduler.JobUpdate) (bool, error) {
 	status := string(update.Status)
@@ -333,7 +382,7 @@ func setupLogger(cfg *config.Config) *slog.Logger {
 	}
 	opts := &slog.HandlerOptions{Level: level}
 	if cfg.Log.File != "" {
-		if f, err := os.OpenFile(cfg.Log.File, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
+		if f, err := os.OpenFile(cfg.Log.File, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600); err == nil {
 			return slog.New(slog.NewJSONHandler(f, opts))
 		}
 	}
@@ -378,18 +427,28 @@ func bootstrapAdminToken(st *store.Store, cfg *config.Config, logger *slog.Logge
 	}); err != nil {
 		return err
 	}
-	logger.Info("已创建 admin token",
-		"id", cfg.Auth.AdminTokenID, "secret", secret)
-	logger.Info("请妥善保存上述 secret，仅此一次显示")
+	// secret 直接写到 stderr，不经过 slog，避免明文出现在持久化结构化日志中
+	fmt.Fprintf(os.Stderr, "[cert-keeper] 已创建 admin token id=%s secret=%s\n", cfg.Auth.AdminTokenID, secret)
+	fmt.Fprintf(os.Stderr, "[cert-keeper] 请妥善保存上述 secret，仅此一次显示\n")
 	return nil
 }
 
-func startNonceCleaner(st *store.Store, cfg *config.Config, logger *slog.Logger) {
-	ticker := time.NewTicker(time.Duration(cfg.Auth.NonceTTLSec) * time.Second)
+func startNonceCleaner(ctx context.Context, st *store.Store, cfg *config.Config, logger *slog.Logger) {
+	ttl := cfg.Auth.NonceTTLSec
+	if ttl <= 0 {
+		// NonceTTLSec 为 0 会导致 time.NewTicker panic，使用默认值 300 秒
+		ttl = 300
+	}
+	ticker := time.NewTicker(time.Duration(ttl) * time.Second)
 	defer ticker.Stop()
-	for range ticker.C {
-		if err := st.CleanOldNonces(context.Background(), time.Now().Unix()-int64(cfg.Auth.NonceTTLSec*2)); err != nil {
-			logger.Warn("清理过期 nonce 失败", "err", err)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := st.CleanOldNonces(ctx, time.Now().Unix()-int64(ttl*2)); err != nil {
+				logger.Warn("清理过期 nonce 失败", "err", err)
+			}
 		}
 	}
 }

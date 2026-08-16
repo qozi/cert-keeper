@@ -582,7 +582,7 @@ func (c *cli) tokenUpdateV2(args []string) error {
 		target.IsAdmin = false
 	}
 	if (disabled || notAdmin) && wasAdmin {
-		if err := c.protectLastAdmin(&store.Token{IsAdmin: true}, true); err != nil {
+		if err := c.protectLastAdmin(target, disabled || notAdmin); err != nil {
 			return err
 		}
 	}

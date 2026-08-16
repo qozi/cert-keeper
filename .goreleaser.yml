@@ -11,7 +11,11 @@ builds:
     env:
       - CGO_ENABLED=0
     flags: [-trimpath]
-    ldflags: [-s, -w]
+    ldflags:
+      - -s -w
+      - -X github.com/siidoo/certkeeper/internal/version.Version={{.Version}}
+      - -X github.com/siidoo/certkeeper/internal/version.GitCommit={{.ShortCommit}}
+      - -X github.com/siidoo/certkeeper/internal/version.BuildDate={{.Date}}
     targets:
       - linux_amd64
       - linux_arm64
@@ -24,7 +28,11 @@ builds:
     env:
       - CGO_ENABLED=0
     flags: [-trimpath]
-    ldflags: [-s, -w]
+    ldflags:
+      - -s -w
+      - -X github.com/siidoo/certkeeper/internal/version.Version={{.Version}}
+      - -X github.com/siidoo/certkeeper/internal/version.GitCommit={{.ShortCommit}}
+      - -X github.com/siidoo/certkeeper/internal/version.BuildDate={{.Date}}
     targets:
       - linux_amd64
       - linux_arm64
@@ -37,7 +45,11 @@ builds:
     env:
       - CGO_ENABLED=0
     flags: [-trimpath]
-    ldflags: [-s, -w]
+    ldflags:
+      - -s -w
+      - -X github.com/siidoo/certkeeper/internal/version.Version={{.Version}}
+      - -X github.com/siidoo/certkeeper/internal/version.GitCommit={{.ShortCommit}}
+      - -X github.com/siidoo/certkeeper/internal/version.BuildDate={{.Date}}
     targets:
       - linux_amd64
       - linux_arm64

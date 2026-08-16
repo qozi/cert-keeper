@@ -173,7 +173,14 @@ func (s *Server) registerClient(w http.ResponseWriter, r *http.Request) {
 		Hostname string `json:"hostname"`
 		OSInfo   string `json:"os_info"`
 	}
-	_ = readJSON(r, &req)
+	if err := readJSON(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请求体格式错误: " + err.Error()})
+		return
+	}
+	if len(req.Hostname) > 255 || len(req.OSInfo) > 255 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "hostname 或 os_info 超过长度限制"})
+		return
+	}
 	if err := s.Store.UpsertClient(r.Context(), &store.Client{
 		TokenID:  t.ID,
 		Hostname: nullable(req.Hostname),

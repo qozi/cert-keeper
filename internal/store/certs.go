@@ -58,7 +58,15 @@ func (s *Store) UpsertCert(ctx context.Context, c *Cert) error {
 		   reload_cmd=excluded.reload_cmd, updated_at=excluded.updated_at, source=excluded.source`,
 		c.Domain, c.SAN, c.CA, c.ChallengeMode, c.DNSProvider, c.DNSProfile, c.WebrootPath,
 		c.Keylength, c.RenewDays, c.ReloadCmd, c.CreatedAt, c.UpdatedAt, c.Source)
-	return err
+	if err != nil {
+		return err
+	}
+	// 回填真实的 created_at：UPDATE 路径下数据库保留原始值，Go 结构体需同步。
+	var realCreatedAt int64
+	if qErr := s.DB.QueryRowContext(ctx, `SELECT created_at FROM certs WHERE domain=?`, c.Domain).Scan(&realCreatedAt); qErr == nil {
+		c.CreatedAt = realCreatedAt
+	}
+	return nil
 }
 
 // GetCert 根据域名获取证书配置，不存在返回 nil。
