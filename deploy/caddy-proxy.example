@@ -1,0 +1,7 @@
+# 将域名替换为生产地址。Caddy 自动申请并续期前端 TLS 证书。
+ck.example.com {
+	reverse_proxy 127.0.0.1:3780
+
+	@metrics path /metrics
+	respond @metrics 403
+}

@@ -23,7 +23,15 @@
 
 - **Token 加密存储**：token secret 以 AES-256-GCM 加密后入库（`secret_ciphertext`，带版本号），AAD 绑定 token ID；旧明文列在轮换后清空。常规列表与 JSON 输出不含 secret。
 - **DNS Secret 加密存储**：同样使用 AES-256-GCM，AAD 绑定 `provider/profile/env_key`；主密钥来自配置 `storage.encryption_key` 或环境变量 `CK_ENCRYPTION_KEY`。
-- 主密钥必须显式提供（compose 中无默认值）；轮换主密钥会导致已存密文无法解密，需提前重新录入 Secret。
+- 生产根密钥必须通过 `CK_ENCRYPTION_KEY` 显式提供（compose 中无默认值）。配置中的
+  `storage.encryption_key` 可用但不建议生产使用，因为它会把密钥写入配置文件。
+- 旧版本可能在 SQLite 旁生成 `<sqlite_path>.kek`（通常是
+  `/data/db/certkeeper.db.kek`）。首次以 `CK_ENCRYPTION_KEY` 启动时，程序将 `.db.kek` 作为迁移
+  回退密钥，自动把旧 token/DNS 密文重加密到当前根密钥，并清空旧 token 明文列。
+- 迁移前必须同时备份数据库、`.db.kek` 与新 `CK_ENCRYPTION_KEY`；启动后等待 `/readyz`
+  的 `store_encryption` 检查通过，再验证 profile secret 和 token 可用。不要先删除 `.db.kek`，
+  也不要只替换根密钥后丢弃旧密钥。内置 backup 会在文件存在时收入 `.db.kek`，但环境注入的
+  `CK_ENCRYPTION_KEY` 必须由外部密钥系统单独备份。
 
 ## 服务端 generation 原子发布
 
@@ -39,11 +47,15 @@
 - 全程持有 flock 部署锁，目录/文件权限收紧（0700/0600），拒绝符号链接。
 - 部署结果通过 `POST /api/v2/certs/{domain}/deployments` 回报服务端。
 
-## DNS 凭据零持久化
+## ACME 状态与 DNS 凭据隔离
 
-- 每次签发/续期使用独立的 acme 临时 config-home（`0700` 权限临时目录），操作结束后删除。
-- DNS 凭据仅在内存中解密并注入 acme.sh 子进程环境变量，不写入 acme home、证书目录等持久位置。
-- 操作前后对持久目录做 canary 扫描：一旦发现凭据残留即报错（错误信息不含凭据值）。
+- `acme.home` 是持久 config-home，保存 ACME 账户、CA 与域名续期状态。它必须与数据库和证书
+  仓储一起持久化和备份，否则恢复后可能丢失账户/续期上下文。
+- 每次 issue/renew/install 流程创建权限为 `0700` 的临时目录和独立 `accountconf`。DNS Secret
+  只在内存中解密、注入 acme.sh 子进程环境，并允许 DNS 插件把 `SAVED_*` 写入这份临时
+  accountconf；同一流程的步骤复用它，流程结束后删除。
+- 账户注册直接使用持久 config-home，不使用临时 accountconf。持久 config-home 和证书仓储
+  会执行凭据残留扫描；检测到泄漏时操作失败，错误信息不会包含凭据值。
 
 ## 审计事件
 
@@ -53,6 +65,9 @@
 
 ## 传输与边界
 
-- 服务端自身 TLS 建议由反向代理终止；直接暴露时开启 `server.tls` 并配置证书。
+- `server.tls_mode` 只有 `direct`、`proxy`、`development`。生产 direct 模式必须配置证书和
+  私钥；proxy 模式应只监听回环地址，或显式设置 `trusted_proxies` 后再由网络层限制后端端口。
+  `development` 允许明文 HTTP，只用于本地调试。
+- `auth.legacy_api_enabled` 生产必须为 `false`；客户端 v2 请求失败时不得以 `--v1` 重试。
 - `/readyz`、`/metrics` 不含机密信息，但仍建议仅对监控网络暴露（可用 `observability` 配置段关闭）。
-- v2 仅支持 `dns_api` 挑战模式，standalone/webroot/dns_manual 场景请使用 v1 流程。
+- v2 仅支持 `dns_api`。生产不应为其他 challenge 模式重新开启 v1；需迁移到 DNS API profile。

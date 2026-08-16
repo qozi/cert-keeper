@@ -26,6 +26,9 @@
 
 ## 服务端 API
 
+以下 `/api/v1` 路由仅用于迁移兼容，生产配置默认通过 `auth.legacy_api_enabled: false` 完全关闭。
+新部署应使用后文 v2 路由与 server CLI。
+
 ### 客户端 API（需 client token）
 
 | 方法 | 路径 | 用途 |
@@ -105,12 +108,99 @@ DNS Secret 建议通过标准输入传入，避免出现在 shell 历史中：
 ```bash
 printf '%s\n' '<your_cf_key>' | certk-server-cli \
   --config /data/config/config.yaml secret set \
-  --provider dns_cf --env-key CF_Key --value-stdin
+  --provider dns_cf --profile default --env-key CF_Key --value-stdin
 ```
 
 CLI 与服务端进程共享 ACME 文件锁，同一时间只允许一个进程调用 acme.sh。
 
-## 快速开始
+## 生产部署（v2）
+
+生产环境以异步 v2 为唯一流程：服务端 `auth.legacy_api_enabled: false`，客户端不使用
+`--v1`。`POST .../reconcile` 返回 HTTP `202 Accepted` 和任务 `Location` 后，官方客户端会持续
+查询 `GET /api/v2/jobs/{job_id}`，任务成功后才下载 manifest 与 generation；任务失败或轮询
+中断会直接报错，不会回退 v1。
+
+### 1. 准备密钥与 TLS
+
+`CK_ENCRYPTION_KEY` 必须显式注入并离线备份，不能使用示例值：
+
+```bash
+install -m 0600 /dev/null deploy/.env
+docker run --rm ghcr.io/qozi/certkeeper/certk-server:latest \
+  --gen-encryption-key | sed 's/^/CK_ENCRYPTION_KEY=/' > deploy/.env
+```
+
+默认 Compose 使用 **proxy TLS**：容器端口只发布到宿主机 `127.0.0.1:3780`，公网 HTTPS
+由 [nginx 示例](deploy/nginx-proxy.conf.example) 或 [Caddy 示例](deploy/caddy-proxy.example)
+终止。直接 TLS 则将 `server.tls_mode` 改为 `direct`，配置 `/data/tls/fullchain.pem` 与
+`/data/tls/key.pem`，只暴露 HTTPS 端口并为证书目录增加只读挂载。生产不得使用
+`development` 模式或公网 HTTP。
+
+### 2. 启动并检查
+
+```bash
+cd deploy
+docker compose up -d
+docker compose ps
+curl --fail http://127.0.0.1:3780/readyz
+```
+
+`/readyz` 检查数据库、密文可解密性、ACME/证书目录可写性及 worker heartbeat；`/metrics`
+为 Prometheus 文本端点，应只允许监控网访问。服务端进程同时运行持久任务 worker，不能用
+仅启动 HTTP 进程的方式拆开部署。启动过程不会自动升级 acme.sh。
+
+### 3. 创建 DNS profile、证书配置与 grant
+
+DNS 凭据按 `provider/profile` 隔离，值只允许从标准输入或权限不超过 `0600` 的文件传入：
+
+```bash
+docker compose exec certkeeper certk-server-cli profile create \
+  --provider dns_cf --profile production --account ops@example.com
+printf '%s\n' "$CF_API_TOKEN" | docker compose exec -T certkeeper \
+  certk-server-cli secret set --provider dns_cf --profile production \
+  --env-key CF_Token --value-stdin
+
+docker compose exec certkeeper certk-server-cli cert-config set \
+  -d example.com --mode dns_api --dns-provider dns_cf --dns-profile production
+printf '%s\n' "$WEB01_TOKEN_SECRET" | docker compose exec -T certkeeper \
+  certk-server-cli token create -i web-01 --secret-stdin --note web-01
+
+for permission in apply status read_cert read_private_key; do
+  docker compose exec certkeeper certk-server-cli grant add \
+    --token web-01 --domain example.com --permission "$permission"
+done
+```
+
+v2 grant 是 deny-by-default，admin token 也不绕过。强制重签还要求 admin 身份和 `force`
+grant。把创建 token 时提供的 secret 写入目标机 `/etc/certkeeper/client.yaml`，权限设为 `0600`。
+
+### 4. 客户端定时同步
+
+```bash
+certk-client apply -c /etc/certkeeper/client.yaml -d example.com
+sudo systemctl enable --now 'certkeeper-client@example.com.timer'
+```
+
+systemd 模板位于 `deploy/systemd/`。客户端先下载到 `releases/<generation>/`，校验 manifest、
+证书链和私钥后原子更新 `current` 指针；消费方应使用稳定路径，例如
+`/etc/nginx/certs/current/fullchain.pem` 和 `/etc/nginx/certs/current/key.pem`，不要引用具体
+generation。`verify_cmd` 失败会回滚 `current`，`reload_cmd` 失败会保留新证书并在运维侧告警。
+
+### 5. 备份
+
+```bash
+docker compose exec certkeeper certk-server-cli backup create \
+  --destination /data/backup/$(date +%Y%m%d-%H%M%S)
+docker compose exec certkeeper certk-server-cli backup verify \
+  --path /data/backup/<备份目录>
+```
+
+内置备份包含 SQLite 一致性快照、证书 generation 仓储、持久 ACME config-home，以及存在时
+用于旧数据迁移的 `.db.kek`。还必须在备份系统中单独保存 `CK_ENCRYPTION_KEY` 和 TLS 前端/直连
+证书及私钥；缺少任一密钥、ACME state 或证书仓储都不视为完整灾备。备份卷应再同步到离线或
+异地存储，不能只留在同一 Docker 主机。
+
+## 开发快速开始
 
 ### 1. 构建
 
@@ -133,9 +223,9 @@ go run ./cmd/server -config deploy/config.local.example.yaml
 ```bash
 # 终端2：编辑 deploy/client.local.example.yaml，填入服务端日志输出的 admin secret
 #         随后可直接用 -c 指定该配置运行客户端
-go run ./cmd/client -c deploy/client.local.example.yaml test
-go run ./cmd/client -c deploy/client.local.example.yaml register
-go run ./cmd/client -c deploy/client.local.example.yaml apply -d example.com --out-dir ./.local/certs
+go run ./cmd/client test -c deploy/client.local.example.yaml
+go run ./cmd/client register -c deploy/client.local.example.yaml
+go run ./cmd/client apply -c deploy/client.local.example.yaml -d example.com --out-dir ./.local/certs
 ```
 
 仅调试 API、SQLite、鉴权与客户端通信时，无需安装 `acme.sh`；真实签发证书仍需本机安装 [acme.sh](https://get.acme.sh)。本机调试可配合 Delve 断点：
@@ -143,56 +233,7 @@ go run ./cmd/client -c deploy/client.local.example.yaml apply -d example.com --o
 ```bash
 go install github.com/go-delve/delve/cmd/dlv@latest
 dlv debug ./cmd/server -- -config deploy/config.local.example.yaml
-dlv debug ./cmd/client -- -c deploy/client.local.example.yaml test
-```
-
-### 3. 启动服务端（Docker）
-
-```bash
-cd deploy
-# 生成加密密钥（首次）
-docker run --rm certkeeper/certk-server:latest --gen-encryption-key > .env
-echo "CK_ENCRYPTION_KEY=$(cat .env)" > .env
-docker compose up -d
-# 首次启动会在日志输出 admin token secret，仅显示一次
-docker compose logs certkeeper | grep "已创建 admin token"
-```
-
-### 4. 配置证书（方式1）
-
-```bash
-# 1. 添加 DNS Secret（以 CloudFlare 为例）
-curl -X POST .../api/v1/admin/secrets \
-  -d '{"provider":"dns_cf","env_key":"CF_Key","env_value":"<your_cf_key>"}'
-curl -X POST .../api/v1/admin/secrets \
-  -d '{"provider":"dns_cf","env_key":"CF_Email","env_value":"you@example.com"}'
-
-# 2. 创建证书配置
-curl -X POST .../api/v1/admin/certs \
-  -d '{"domain":"example.com","challenge_mode":"dns_api","dns_provider":"dns_cf","renew_days":30}'
-
-# 3. 为目标机器创建 client token
-curl -X POST .../api/v1/admin/tokens \
-  -d '{"note":"web-01","auto_gen":true,"enabled":true}'
-```
-
-### 5. 客户端使用
-
-```bash
-# 部署客户端二进制
-sudo install -m 0755 certk-client /usr/local/bin/certkeeper-client
-sudo mkdir -p /etc/certkeeper
-sudo cp client.example.yaml /etc/certkeeper/client.yaml
-# 编辑 /etc/certkeeper/client.yaml 填入 server / token_id / token_secret
-
-# 注册
-certkeeper-client register
-
-# 手动申请/续签
-certkeeper-client apply -d example.com
-
-# 配置 crontab（每天凌晨 3 点检查）
-echo "0 3 * * * /usr/local/bin/certkeeper-client apply -d example.com --quiet" | sudo crontab -
+dlv debug ./cmd/client -- test -c deploy/client.local.example.yaml
 ```
 
 ## 目录结构
@@ -219,7 +260,10 @@ extra-tools/cert-keeper/
 │   ├── config.example.yaml
 │   ├── client.example.yaml
 │   ├── config.local.example.yaml  本地源码调试（go run）
-│   └── client.local.example.yaml  本地源码调试（go run）
+│   ├── client.local.example.yaml  本地源码调试（go run）
+│   ├── nginx-proxy.conf.example   nginx TLS 终止模板
+│   ├── caddy-proxy.example        Caddy TLS 终止模板
+│   └── systemd/                   服务端与客户端 timer 模板
 └── scripts/build.sh            本地 / 跨平台 / Docker 构建
 ```
 
@@ -228,9 +272,10 @@ extra-tools/cert-keeper/
 ```
 /data/
 ├── db/certkeeper.db            SQLite（tokens / certs / secrets / clients / logs / nonces）
-├── acme/                       acme.sh 主目录（账户、CA 配置、原始证书）
-├── certs/<domain>/             最终证书产物
-│   ├── cert.pem  key.pem  fullchain.pem  ca.pem  time.log
+├── acme/                       持久 config-home（账户、CA、域名续期状态）
+├── certs/<domain>/generations/ 不可变证书 generation
+├── certs/<domain>/current      服务端稳定 generation 指针
+├── backup/                     server-cli 备份目标（独立持久卷）
 ├── logs/certkeeper.log
 └── config/config.yaml
 ```
@@ -248,14 +293,14 @@ extra-tools/cert-keeper/
 
 DNS Secret 由服务端按 `provider` 名分组加密存储；acme.sh 调用时临时解密注入子进程环境变量，不落盘、不回传客户端。
 
-## 续签流程
+## v2 异步续签流程
 
-1. 客户端 cron 调用 `apply -d <domain>`。
-2. 服务端读取该域名预置配置（或方式2 客户端推参）。
-3. 解析现有 `fullchain.pem` 的 `NotAfter`：若距到期日大于 `renew_days`，直接返回当前文件清单，不重新签发。
-4. 若需要续签：解密 DNS Secret 注入环境变量，调用 `acme.sh --issue` + `--install-cert`，更新 `time.log`。
-5. 客户端按返回的文件 SHA256 逐个下载，与本地 `.bak` 备份；若服务端 `time.log` 未变则跳过下载。
-6. 下载完成执行 `verify_cmd`（如 `nginx -t`），失败则回滚证书；通过后执行 `reload_cmd`（如 `systemctl reload nginx`），失败不回滚（证书已更新，不应因 reload 失败回退证书）。
+1. 客户端 timer 调用 `apply -d <domain>`，服务端验证域名 grant 并返回 `202` 任务。
+2. 内置持久 worker claim 任务；进程重启后未完成任务可恢复，客户端轮询 job URL。
+3. worker 读取预置的 `dns_api` + DNS profile；无需续期时复用 current generation。
+4. 需要签发时，acme.sh 复用持久 config-home，并对本次操作使用临时 `accountconf` 注入 DNS 凭据。
+5. 服务端发布不可变 generation 并原子更新服务端 `current`，客户端按 manifest 下载和校验。
+6. 客户端原子更新本地 `current`，执行 verify/reload 并回报 deployment。
 
 ## 与参考项目 acmeDeliver 的差异
 
@@ -273,7 +318,8 @@ DNS Secret 由服务端按 `provider` 名分组加密存储；acme.sh 调用时�
 
 - 当前版本无 Web UI，所有管理通过 HTTP API。
 - 方式2 推参申请默认要求 admin token，避免普通客户端签发任意域名。
-- 服务端自身 TLS 证书建议由反向代理（nginx/Caddy）终止；如需服务端直接暴露 HTTPS，在配置中开启 `tls` 并指定证书路径（可先用 acme.sh 为服务端自身域名签一张）。
+- 服务端 TLS 建议由反向代理（nginx/Caddy）终止；直接暴露 HTTPS 时使用
+  `server.tls_mode: direct` 并配置 `cert_file/key_file`。
 - DNS 手动模式（`dns_manual`）无自动续签，仅用于一次性签发。
 
 ## v2 说明
@@ -282,8 +328,8 @@ v2 引入 generation 证书模型与更严格的授权：服务端将每次签�
 （`<certs_dir>/<domain>/generations/<gen>/` + 原子 `current` 指针），客户端按 manifest
 校验后原子部署到本地 `releases/<gen>/` + `current` 布局，verify 失败自动回滚。
 
-- **客户端默认走 v2**：`certkeeper-client apply/status/download` 默认使用 v2 流程；
-  服务端不支持时自动回退 v1，也可用 `--v1` 强制旧流程。
+- **客户端默认且生产只走 v2**：`certk-client apply/status/download` 默认使用 v2 流程；
+  v2 失败不会自动回退。`--v1` 只用于明确启用 legacy API 的迁移环境。
 - **grant 必需**：v2 授权为 deny-by-default，按 `(token, domain, permission)` 检查，
   admin 也不绕过。调用前需先授权：
   `certk-server-cli grant add --token <id> --domain <d> --permission apply`

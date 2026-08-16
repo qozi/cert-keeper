@@ -1,9 +1,9 @@
 # CertKeeper 客户端本地调试配置
 # 适用场景：配合 deploy/config.local.example.yaml 启动的本地服务端
 # 用法：
-#   go run ./cmd/client -c deploy/client.local.example.yaml test
-#   go run ./cmd/client -c deploy/client.local.example.yaml register
-#   go run ./cmd/client -c deploy/client.local.example.yaml apply -d example.com --out-dir ./.local/certs
+#   go run ./cmd/client test -c deploy/client.local.example.yaml
+#   go run ./cmd/client register -c deploy/client.local.example.yaml
+#   go run ./cmd/client apply -c deploy/client.local.example.yaml -d example.com --out-dir ./.local/certs
 # 首次启动服务端时，日志会打印 admin token secret（仅一次），填入下方 token_secret
 
 server: "http://127.0.0.1:3780"
@@ -11,6 +11,7 @@ token_id: "admin"
 token_secret: "REPLACE_WITH_ADMIN_SECRET_FROM_SERVER_LOG"
 log_file: ""
 log_level: "debug"
+# v2 apply 收到 HTTP 202 后自动轮询；当前无 polling 配置字段。
 
 defaults:
   out_dir: "./.local/certs"

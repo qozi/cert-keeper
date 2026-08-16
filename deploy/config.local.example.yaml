@@ -5,7 +5,7 @@
 
 server:
   listen: "127.0.0.1:3780"   # 仅监听本机，避免暴露到外网
-  tls: false
+  tls_mode: "development"     # 本地可用 HTTP；生产必须改为 direct 或 proxy
   base_url: "http://127.0.0.1:3780"
   # HTTP 超时，0 表示不限制；read_header_timeout 不能大于 read_timeout
   read_header_timeout: 10s
@@ -17,6 +17,7 @@ auth:
   timestamp_window_sec: 300
   nonce_ttl_sec: 300
   admin_token_id: "admin"    # 首次启动自动创建 admin token，secret 仅在日志中输出一次
+  legacy_api_enabled: false   # 即使本地调试也默认验证 v2-only 行为
 
 storage:
   sqlite_path: "./.local/data/db/certkeeper.db"
@@ -24,7 +25,7 @@ storage:
   encryption_key: "local-dev-encryption-key-32-bytes-or-more"
 
 acme:
-  home: "./.local/data/acme"
+  home: "./.local/data/acme" # 持久 config-home；临时 accountconf 由程序自动创建并清理
   certs_dir: "./.local/data/certs"
   default_ca: "letsencrypt"
   default_keylength: "ec-256"
@@ -40,10 +41,15 @@ log:
   max_backups: 3
 
 scheduler:
-  enabled: true              # 本地调试可改为 false 关闭自动续期调度
+  enabled: true              # 内置持久 worker 同时消费异步任务
   interval: 12h              # 调度轮询间隔
   jitter: 1h                 # 随机抖动，必须小于 interval
+  # worker polling 固定为 5s；客户端收到 202 后自动 polling，无独立配置项
 
 observability:
   metrics_enabled: true      # 暴露 /metrics
   ready_enabled: true        # 暴露 /readyz
+
+# 本地备份建议写入 ./.local/data/backup/<唯一目录名>：
+# go run ./cmd/server-cli --config deploy/config.local.example.yaml backup create \
+#   --destination ./.local/data/backup/$(date +%Y%m%d-%H%M%S)

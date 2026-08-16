@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   certkeeper:
     image: ghcr.io/qozi/certkeeper/certk-server:latest
@@ -10,9 +8,15 @@ services:
     container_name: certkeeper
     restart: unless-stopped
     ports:
-      - "8443:8443"
+      # proxy TLS 示例：后端只发布到宿主机回环地址，由 nginx/Caddy 提供公网 HTTPS。
+      - "127.0.0.1:3780:3780"
     volumes:
-      - ./data:/data
+      - ./config.example.yaml:/data/config/config.yaml:ro
+      - certkeeper-db:/data/db
+      - certkeeper-acme:/data/acme
+      - certkeeper-certs:/data/certs
+      - certkeeper-backup:/data/backup
+      - certkeeper-logs:/data/logs
     environment:
       # 加密主密钥必须显式提供，无默认值：请先在 deploy/.env 中设置
       # CK_ENCRYPTION_KEY（可用 certk-server --gen-encryption-key 生成）。
@@ -20,9 +24,16 @@ services:
       - CK_ENCRYPTION_KEY=${CK_ENCRYPTION_KEY:?必须在 .env 中设置 CK_ENCRYPTION_KEY（certk-server --gen-encryption-key 生成）}
       - TZ=Asia/Shanghai
     healthcheck:
-      # /readyz 默认开启（observability.ready_enabled），任一就绪检查失败返回 503
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8443/readyz"]
+      # proxy 模式下容器内仍使用 HTTP；公网 TLS 由反向代理终止。
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3780/readyz"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 10s
+
+volumes:
+  certkeeper-db:
+  certkeeper-acme:
+  certkeeper-certs:
+  certkeeper-backup:
+  certkeeper-logs:

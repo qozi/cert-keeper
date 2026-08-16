@@ -1,0 +1,15 @@
+[Unit]
+Description=CertKeeper 客户端证书同步（%i）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/certk-client apply -c /etc/certkeeper/client.yaml -d %i --quiet
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# 按实际证书输出目录调整。
+ReadWritePaths=/etc/nginx/certs /var/log

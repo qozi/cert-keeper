@@ -6,6 +6,8 @@ token_id: "web01"
 token_secret: "REPLACE_WITH_TOKEN_SECRET"
 log_file: "/var/log/certkeeper.log"
 log_level: "info"
+# v2 apply 收到 HTTP 202 后会自动轮询 Location，直至任务终态。
+# 当前 polling 间隔由客户端内置；生产环境不要使用 --v1 绕过失败。
 
 defaults:
   out_dir: "/etc/nginx/certs"

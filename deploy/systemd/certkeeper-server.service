@@ -1,0 +1,23 @@
+[Unit]
+Description=CertKeeper 服务端与持久任务 worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=certkeeper
+Group=certkeeper
+EnvironmentFile=/etc/certkeeper/server.env
+ExecStart=/usr/local/bin/certk-server --config /etc/certkeeper/server.yaml
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# 与 deploy/config.example.yaml 的 /data 持久路径一致；安装前先创建并授权给 certkeeper 用户。
+ReadWritePaths=/data
+
+[Install]
+WantedBy=multi-user.target

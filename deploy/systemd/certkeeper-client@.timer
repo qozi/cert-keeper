@@ -1,0 +1,11 @@
+[Unit]
+Description=定时运行 CertKeeper 客户端（%i）
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+Unit=certkeeper-client@%i.service
+
+[Install]
+WantedBy=timers.target

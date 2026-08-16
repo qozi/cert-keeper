@@ -2,11 +2,13 @@
 # 部署时放在 /data/config/config.yaml 或挂载位置
 
 server:
-  listen: ":3780"           # 监听地址端口
-  tls: false                # 是否启用 HTTPS（建议反向代理终止 TLS）
-  cert_file: ""             # tls=true 时必填
-  key_file: ""              # tls=true 时必填
-  base_url: "https://ck.example.com:3780"
+  listen: ":3780"           # Compose 容器内监听；端口仅发布到宿主机回环地址
+  tls_mode: "proxy"          # direct / proxy / development；生产只使用 direct 或 proxy
+  cert_file: ""              # direct 模式必填，例如 /data/tls/fullchain.pem
+  key_file: ""               # direct 模式必填，例如 /data/tls/key.pem
+  trusted_proxies:           # proxy 非回环监听必须填写；此处限制为 Docker 私网
+    - "172.16.0.0/12"
+  base_url: "https://ck.example.com"
   # 以下超时对应 http.Server 同名字段，0 表示不限制
   read_header_timeout: 10s  # 读取请求头超时（不能大于 read_timeout）
   read_timeout: 30s         # 读取整个请求的超时
@@ -17,6 +19,7 @@ auth:
   timestamp_window_sec: 300  # 客户端时间戳允许误差
   nonce_ttl_sec: 300          # nonce 防重放窗口
   admin_token_id: "admin"     # 首次启动自动创建的 admin token id
+  legacy_api_enabled: false    # 生产默认关闭 /api/v1；客户端不得回退 v1
 
 storage:
   sqlite_path: "/data/db/certkeeper.db"
@@ -25,13 +28,13 @@ storage:
   encryption_key: ""
 
 acme:
-  home: "/data/acme"          # acme.sh 主目录
+  home: "/data/acme"          # 持久 config-home：账户、CA 和域名续期状态必须备份
   certs_dir: "/data/certs"    # 证书产物根目录
   default_ca: "letsencrypt"   # letsencrypt / zerossl / buypass
   default_keylength: "ec-256"
   default_renew_days: 30
   issue_timeout: 300s         # 单次签发超时
-  auto_upgrade: true          # 启动时升级 acme.sh
+  auto_upgrade: false         # 禁止启动时升级；版本随镜像发布
   acme_sh_path: "/root/.acme.sh/acme.sh"
 
 log:
@@ -41,10 +44,14 @@ log:
   max_backups: 3
 
 scheduler:
-  enabled: true               # 是否启用服务端续期调度器（自动对预置证书执行 reconcile）
+  enabled: true               # 同进程持久 worker：消费 202 任务并调度预置证书续期
   interval: 12h               # 调度轮询间隔，必须大于 0
   jitter: 1h                  # 每轮随机抖动，避免多实例同时触发；必须小于 interval
+  # worker 任务 polling 当前固定为 5s；客户端收到 202 后也会自动 polling，无独立配置项
 
 observability:
   metrics_enabled: true       # 暴露 /metrics（Prometheus 文本格式）
-  ready_enabled: true         # 暴露 /readyz 就绪检查（docker-compose healthcheck 依赖此项）
+  ready_enabled: true         # 暴露 /readyz（含数据库、密钥、目录和 worker heartbeat）
+
+# 备份目录不属于服务端配置字段。生产模板将 /data/backup 独立持久挂载，并使用：
+# certk-server-cli backup create --destination /data/backup/<唯一目录名>
